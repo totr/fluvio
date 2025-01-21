@@ -1,10 +1,11 @@
 use std::time::Duration;
 
+use fluvio::TopicProducerPool;
 use futures_lite::StreamExt;
 use tracing::debug;
 use clap::Parser;
 
-use fluvio::{Offset, TopicProducer, TopicProducerConfigBuilder, FluvioAdmin};
+use fluvio::{Offset, TopicProducerConfigBuilder, FluvioAdmin};
 use fluvio_protocol::record::Batch;
 use fluvio_protocol::record::RawRecords;
 use fluvio_protocol::Encoder;
@@ -34,11 +35,9 @@ pub async fn batching(
 
     println!("Found leader {leader}");
 
-    let consumer = test_driver.get_consumer(&topic_name, 0).await;
-    let mut stream = consumer
-        .stream(Offset::end())
-        .await
-        .expect("Failed to create consumer stream");
+    let mut stream = test_driver
+        .get_consumer_with_start(&topic_name, 0, Offset::end())
+        .await;
 
     for _ in 0..150 {
         // Ensure record is sent after the linger time even if we dont call flush()
@@ -47,7 +46,7 @@ pub async fn batching(
             .build()
             .expect("failed to build config");
 
-        let producer: TopicProducer = test_driver
+        let producer: TopicProducerPool = test_driver
             .create_producer_with_config(&topic_name, config)
             .await;
         debug!("Created producer with linger time");
@@ -66,7 +65,7 @@ pub async fn batching(
             .linger(Duration::from_millis(600000))
             .build()
             .expect("failed to build config");
-        let producer: TopicProducer = test_driver
+        let producer: TopicProducerPool = test_driver
             .create_producer_with_config(&topic_name, config)
             .await;
         debug!("Created producer with large linger time");
@@ -94,7 +93,7 @@ pub async fn batching(
             .build()
             .expect("failed to build config");
 
-        let producer: TopicProducer = test_driver
+        let producer: TopicProducerPool = test_driver
             .create_producer_with_config(&topic_name, config)
             .await;
         debug!("Created producer with small batch size");

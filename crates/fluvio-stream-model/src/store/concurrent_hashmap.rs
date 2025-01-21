@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::collections::BTreeMap;
 use std::hash::Hash;
-use async_rwlock::RwLock;
-use async_rwlock::RwLockReadGuard;
-use async_rwlock::RwLockWriteGuard;
+use async_lock::RwLock;
+use async_lock::RwLockReadGuard;
+use async_lock::RwLockWriteGuard;
 
 /// inefficient but simple concurrent hashmap
 /// this should be only used in a test
@@ -23,11 +23,11 @@ where
         lock.insert(key, value)
     }
 
-    pub async fn read<'a>(&'_ self) -> RwLockReadGuard<'_, HashMap<K, V>> {
+    pub async fn read(&'_ self) -> RwLockReadGuard<'_, HashMap<K, V>> {
         self.0.read().await
     }
 
-    pub async fn write<'a>(&'_ self) -> RwLockWriteGuard<'_, HashMap<K, V>> {
+    pub async fn write(&'_ self) -> RwLockWriteGuard<'_, HashMap<K, V>> {
         self.0.write().await
     }
 
@@ -69,11 +69,11 @@ where
         Self(RwLock::new(map))
     }
 
-    pub async fn read<'a>(&'_ self) -> RwLockReadGuard<'_, BTreeMap<K, V>> {
+    pub async fn read(&'_ self) -> RwLockReadGuard<'_, BTreeMap<K, V>> {
         self.0.read().await
     }
 
-    pub async fn write<'a>(&'_ self) -> RwLockWriteGuard<'_, BTreeMap<K, V>> {
+    pub async fn write(&'_ self) -> RwLockWriteGuard<'_, BTreeMap<K, V>> {
         self.0.write().await
     }
 

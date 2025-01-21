@@ -9,6 +9,7 @@ use anyhow::Result;
 
 use fluvio::Fluvio;
 use fluvio::metadata::partition::*;
+use fluvio_sc_schema::objects::ListRequest;
 
 use crate::common::output::Terminal;
 use crate::common::OutputFormat;
@@ -18,6 +19,9 @@ use crate::common::OutputFormat;
 pub struct ListPartitionOpt {
     #[clap(flatten)]
     output: OutputFormat,
+    /// Show system partitions only
+    #[arg(long, short, required = false)]
+    system: bool,
 }
 
 impl ListPartitionOpt {
@@ -29,7 +33,9 @@ impl ListPartitionOpt {
         let output = self.output.format;
         let admin = fluvio.admin().await;
 
-        let partitions = admin.all::<PartitionSpec>().await?;
+        let partitions = admin
+            .list_with_config::<PartitionSpec, String>(ListRequest::default().system(self.system))
+            .await?;
 
         // format and dump to screen
         display::format_partition_response_output(out, partitions, output)?;
@@ -91,9 +97,11 @@ mod display {
                 "TOPIC",
                 "PARTITION",
                 "LEADER",
+                "MIRROR",
                 "REPLICAS",
                 "RESOLUTION",
                 "SIZE",
+                "BASE",
                 "HW",
                 "LEO",
                 "LRS",
@@ -136,9 +144,11 @@ mod display {
                         Cell::new(topic),
                         Cell::new(partition),
                         Cell::new(spec.leader.to_string()),
+                        Cell::new(spec.mirror_string()),
                         Cell::new(format!("{:?}", spec.followers())),
                         Cell::new(format!("{:?}", status.resolution)),
                         Cell::new(printable_size),
+                        Cell::new(format!("{:?}", status.base_offset)),
                         Cell::new(status.leader.hw.to_string()),
                         Cell::new(status.leader.leo.to_string()),
                         Cell::new(status.leader.leo.to_string()),

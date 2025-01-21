@@ -1,6 +1,3 @@
-#[cfg(feature = "stats")]
-mod stats;
-
 pub use cmd::ProduceOpt;
 
 mod cmd {
@@ -15,19 +12,21 @@ mod cmd {
     use std::path::PathBuf;
 
     use async_trait::async_trait;
+    use fluvio_sc_schema::partition::PartitionMirrorConfig;
+    use fluvio_sc_schema::topic::{MirrorConfig, PartitionMap, ReplicaSpec, TopicSpec};
     #[cfg(feature = "producer-file-io")]
     use futures::future::join_all;
     use clap::Parser;
     use tracing::{error, warn};
     use humantime::parse_duration;
-    use anyhow::Result;
+    use anyhow::{bail, Result};
 
     use fluvio::{
-        Compression, Fluvio, FluvioError, TopicProducer, TopicProducerConfigBuilder, RecordKey,
+        Compression, Fluvio, FluvioError, TopicProducerPool, TopicProducerConfigBuilder, RecordKey,
         ProduceOutput, DeliverySemantic, SmartModuleContextData, Isolation, SmartModuleInvocation,
     };
     use fluvio_extension_common::Terminal;
-    use fluvio_types::print_cli_ok;
+    use fluvio_types::{print_cli_ok, PartitionId};
 
     #[cfg(feature = "producer-file-io")]
     use fluvio_cli_common::user_input::{UserInputRecords, UserInputType};
@@ -45,9 +44,6 @@ mod cmd {
     use crate::client::smartmodule_invocation::create_smartmodule_from_path;
     use crate::CliError;
     use fluvio_smartengine::transformation::TransformationConfig;
-
-    #[cfg(feature = "stats")]
-    use super::stats::*;
 
     // -----------------------------------
     // CLI Options
@@ -106,9 +102,13 @@ mod cmd {
         #[arg(long, value_parser=parse_duration)]
         pub linger: Option<Duration>,
 
-        /// Max amount of bytes accumulated before sending
+        /// Max number of records to batch before sending
         #[arg(long)]
         pub batch_size: Option<usize>,
+
+        /// Max amount of bytes accumulated before sending
+        #[arg(long)]
+        pub max_request_size: Option<usize>,
 
         /// Isolation level that producer must respect.
         /// Supported values: read_committed (ReadCommitted) - wait for records to be committed before response,
@@ -161,39 +161,26 @@ mod cmd {
 
         #[cfg(feature = "producer-file-io")]
         /// (Optional) Path to a file with transformation specification.
-        #[arg(long, conflicts_with = "smartmodule_group")]
-        pub transforms_file: Option<PathBuf>,
+        #[arg(
+            short,
+            long,
+            conflicts_with = "smartmodule_group",
+            alias = "transforms-file"
+        )]
+        pub transforms: Option<PathBuf>,
 
         /// (Optional) Transformation specification as JSON formatted string.
-        /// E.g. fluvio produce topic-name --transform='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
-        #[arg(long, short, conflicts_with_all = &["smartmodule_group", "transforms_file"])]
-        pub transform: Vec<String>,
-        /*
-        #[cfg(feature = "stats")]
-        /// Experimental: Collect basic producer session statistics and print in stats bar
-        #[arg(long)]
-        pub stats: bool,
+        /// E.g. fluvio produce topic-name --transforms-line='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
+        #[arg(long, conflicts_with_all = &["smartmodule_group", "transforms"], alias = "transform")]
+        pub transforms_line: Vec<String>,
 
-        #[cfg(feature = "stats")]
-        /// Experimental: Collect all producer session statistics and print in stats bar (Implies --stats)
-        #[arg(long)]
-        pub stats_plus: bool,
+        /// Partition id
+        #[arg(short = 'p', long, value_name = "integer", conflicts_with = "mirror")]
+        pub partition: Option<PartitionId>,
 
-        #[cfg(feature = "stats")]
-        /// Experimental: Save producer session stats to file. The resulting file formatted for spreadsheet, as comma-separated values
-        #[arg(long)]
-        pub stats_path: Option<PathBuf>,
-
-        #[cfg(feature = "stats")]
-        /// Experimental: Don't display stats bar when using `--stats` or `--stats-plus`. Use with `--stats-path`.
-        #[arg(long)]
-        pub no_stats_bar: bool,
-
-        #[cfg(feature = "stats")]
-        /// Experimental: Only print the stats summary. Implies `--stats` and `--no-stats-bar`
-        #[arg(long)]
-        pub stats_summary: bool,
-        */
+        /// Remote cluster to consume from
+        #[arg(short = 'm', long, conflicts_with = "partition")]
+        pub mirror: Option<String>,
     }
 
     fn validate_key_separator(separator: &str) -> std::result::Result<String, String> {
@@ -239,21 +226,18 @@ mod cmd {
                 config_builder
             };
 
+            // Max request size
+            let config_builder = if let Some(max_request_size) = self.max_request_size {
+                config_builder.max_request_size(max_request_size)
+            } else {
+                config_builder
+            };
+
             // Isolation
             let config_builder = if let Some(isolation) = self.isolation {
                 config_builder.isolation(isolation)
             } else {
                 config_builder
-            };
-
-            #[cfg(feature = "stats")]
-            // Stats
-            let config_builder = match (self.stats, self.stats_summary, self.stats_plus) {
-                (_, _, true) => config_builder.stats_collect(ClientStatsDataCollect::All),
-                (true, _, false) | (_, true, false) => {
-                    config_builder.stats_collect(ClientStatsDataCollect::Data)
-                }
-                _ => config_builder,
             };
 
             // Delivery Semantic
@@ -269,6 +253,52 @@ mod cmd {
             let config_builder =
                 config_builder.smartmodules(self.smartmodule_invocations(initial_param)?);
 
+            let config_builder = if let Some(mirror) = &self.mirror {
+                let admin = fluvio.admin().await;
+                let topics = admin.all::<TopicSpec>().await?;
+                let partition = topics.into_iter().find_map(|t| match t.spec.replicas() {
+                    ReplicaSpec::Mirror(MirrorConfig::Home(home_mirror_config)) => {
+                        let partitions_maps =
+                            Vec::<PartitionMap>::from(home_mirror_config.as_partition_maps());
+                        partitions_maps.iter().find_map(|p| {
+                            if let Some(PartitionMirrorConfig::Home(remote)) = &p.mirror {
+                                if remote.remote_cluster == *mirror && remote.source {
+                                    return Some(p.id);
+                                }
+                            }
+                            None
+                        })
+                    }
+                    ReplicaSpec::Mirror(MirrorConfig::Remote(remote_mirror_config)) => {
+                        let partitions_maps =
+                            Vec::<PartitionMap>::from(remote_mirror_config.as_partition_maps());
+                        partitions_maps.iter().find_map(|p| {
+                            if let Some(PartitionMirrorConfig::Remote(remote)) = &p.mirror {
+                                if remote.home_cluster == *mirror && remote.target {
+                                    return Some(p.id);
+                                }
+                            }
+                            None
+                        })
+                    }
+                    _ => None,
+                });
+
+                if let Some(partition) = partition {
+                    config_builder.set_specific_partitioner(partition)
+                } else {
+                    bail!("No partition found for mirror '{}'", mirror);
+                }
+            } else {
+                config_builder
+            };
+
+            let config_builder = if let Some(partition) = self.partition {
+                config_builder.set_specific_partitioner(partition)
+            } else {
+                config_builder
+            };
+
             let config = config_builder
                 .delivery_semantic(self.delivery_semantic)
                 .build()
@@ -280,59 +310,19 @@ mod cmd {
                     .await?,
             );
 
-            #[cfg(feature = "stats")]
-            let maybe_stats_bar = if io::stdout().is_tty() {
-                if self.is_stats_collect() {
-                    let stats_bar = if self.is_print_live_stats() {
-                        let s = indicatif::ProgressBar::with_draw_target(
-                            Some(100),
-                            indicatif::ProgressDrawTarget::stderr(),
-                        );
-                        s.set_style(indicatif::ProgressStyle::default_bar().template("{msg}")?);
-                        Some(s)
-                    } else {
-                        None
-                    };
-
-                    // Handle ctrl+c to print summary stats
-                    init_ctrlc(producer.clone(), stats_bar.clone(), self.stats_summary).await?;
-
-                    stats_bar
-                } else {
-                    None
-                }
-            } else {
-                // No tty
-                None
-            };
-
             #[cfg(feature = "producer-file-io")]
             if self.raw {
                 self.process_raw_file(&producer).await?;
             } else {
-                // Read input line-by-line and send as individual records
-                #[cfg(feature = "stats")]
-                self.produce_lines(producer.clone(), maybe_stats_bar.as_ref())
-                    .await?;
-                #[cfg(not(feature = "stats"))]
                 self.produce_lines(producer.clone()).await?;
             };
 
             #[cfg(not(feature = "producer-file-io"))]
             {
-                #[cfg(feature = "stats")]
-                self.produce_lines(producer.clone(), maybe_stats_bar.as_ref())
-                    .await?;
-                #[cfg(not(feature = "stats"))]
                 self.produce_lines(producer.clone()).await?;
             }
 
             producer.flush().await?;
-
-            #[cfg(feature = "stats")]
-            if self.is_stats_collect() {
-                producer_summary(&producer, maybe_stats_bar.as_ref(), self.stats_summary).await;
-            }
 
             if self.interactive_mode() {
                 print_cli_ok!();
@@ -344,7 +334,7 @@ mod cmd {
 
     impl ProduceOpt {
         #[cfg(feature = "producer-file-io")]
-        async fn process_raw_file(&self, producer: &TopicProducer) -> Result<()> {
+        async fn process_raw_file(&self, producer: &TopicProducerPool) -> Result<()> {
             let key = self.key.clone().map(Bytes::from);
             // Read all input and send as one record
             let buffer = match &self.file {
@@ -379,11 +369,6 @@ mod cmd {
                 produce_output.wait().await?;
             }
 
-            #[cfg(feature = "stats")]
-            if self.is_stats_collect() && self.is_print_live_stats() {
-                self.update_stats_bar(maybe_stats_bar.as_ref(), &producer, "");
-            }
-
             Ok(())
         }
 
@@ -397,28 +382,7 @@ mod cmd {
             }
         }
 
-        async fn produce_lines(
-            &self,
-            producer: Arc<TopicProducer>,
-            #[cfg(feature = "stats")] maybe_stats_bar: Option<&ProgressBar>,
-        ) -> Result<()> {
-            #[cfg(feature = "stats")]
-            // If stats file
-            let mut maybe_stats_file = if self.is_stats_collect() {
-                if let Some(stats_path) = &self.stats_path {
-                    let stats_file = start_csv_report(stats_path, &producer).await?;
-                    Some(stats_file)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            #[cfg(feature = "stats")]
-            // Avoid writing duplicate data to disk
-            let mut stats_dataframe_check = 0;
-
+        async fn produce_lines(&self, producer: Arc<TopicProducerPool>) -> Result<()> {
             #[cfg(feature = "producer-file-io")]
             if let Some(path) = &self.file {
                 let reader = BufReader::new(File::open(path)?);
@@ -428,20 +392,6 @@ mod cmd {
 
                     if let Some(produce_output) = produce_output {
                         produce_outputs.push(produce_output);
-                    }
-
-                    #[cfg(feature = "stats")]
-                    if self.is_stats_collect() {
-                        if self.is_print_live_stats() {
-                            self.update_stats_bar(maybe_stats_bar, &producer, &line);
-                        }
-
-                        stats_dataframe_check = write_csv_dataframe(
-                            &producer,
-                            stats_dataframe_check,
-                            maybe_stats_file.as_mut(),
-                        )
-                        .await?;
                     }
                 }
 
@@ -463,15 +413,10 @@ mod cmd {
             #[cfg(not(feature = "producer-file-io"))]
             self.producer_stdin(&producer).await?;
 
-            #[cfg(feature = "stats")]
-            if let Some(file) = maybe_stats_file.as_mut() {
-                file.flush()?;
-            }
-
             Ok(())
         }
 
-        async fn producer_stdin(&self, producer: &Arc<TopicProducer>) -> Result<()> {
+        async fn producer_stdin(&self, producer: &Arc<TopicProducerPool>) -> Result<()> {
             let mut lines = BufReader::new(std::io::stdin()).lines();
             if self.interactive_mode() {
                 eprint!("> ");
@@ -487,26 +432,7 @@ mod cmd {
                     }
                 }
 
-                #[cfg(feature = "stats")]
-                if self.is_stats_collect() {
-                    if self.is_print_live_stats() {
-                        self.update_stats_bar(maybe_stats_bar, &producer, &line);
-                    }
-
-                    stats_dataframe_check = write_csv_dataframe(
-                        &producer,
-                        stats_dataframe_check,
-                        maybe_stats_file.as_mut(),
-                    )
-                    .await?;
-                }
-
                 if self.interactive_mode() {
-                    #[cfg(feature = "stats")]
-                    if let Some(file) = maybe_stats_file.as_mut() {
-                        file.flush()?;
-                    }
-
                     print_cli_ok!();
                     eprint!("> ");
                 }
@@ -516,7 +442,7 @@ mod cmd {
 
         async fn produce_line(
             &self,
-            producer: &Arc<TopicProducer>,
+            producer: &Arc<TopicProducerPool>,
             line: &str,
         ) -> Result<Option<ProduceOutput>> {
             let produce_output = if let Some(separator) = &self.key_separator {
@@ -533,7 +459,7 @@ mod cmd {
 
         async fn produce_key_value(
             &self,
-            producer: Arc<TopicProducer>,
+            producer: Arc<TopicProducerPool>,
             line: &str,
             separator: &str,
         ) -> Result<Option<ProduceOutput>> {
@@ -558,41 +484,14 @@ mod cmd {
 
         #[cfg(feature = "producer-file-io")]
         fn interactive_mode(&self) -> bool {
-            self.file.is_none() && atty::is(atty::Stream::Stdin)
+            use std::io::IsTerminal;
+
+            self.file.is_none() && std::io::stdin().is_terminal()
         }
 
         #[cfg(not(feature = "producer-file-io"))]
         fn interactive_mode(&self) -> bool {
             atty::is(atty::Stream::Stdin)
-        }
-
-        #[cfg(feature = "stats")]
-        fn is_stats_collect(&self) -> bool {
-            self.stats || self.stats_plus || self.stats_summary
-        }
-
-        #[cfg(feature = "stats")]
-        fn is_print_live_stats(&self) -> bool {
-            !self.no_stats_bar && !self.stats_summary
-        }
-
-        #[cfg(feature = "stats")]
-        fn update_stats_bar(
-            &self,
-            maybe_stats_bar: Option<&ProgressBar>,
-            producer: &Arc<TopicProducer>,
-            line: &str,
-        ) {
-            if self.is_print_live_stats() {
-                if let (Some(stats_bar), Some(producer_stats)) = (maybe_stats_bar, producer.stats())
-                {
-                    stats_bar.set_message(format_current_stats(producer_stats));
-
-                    if self.interactive_mode() {
-                        stats_bar.println(line);
-                    }
-                }
-            }
         }
 
         pub fn metadata() -> FluvioExtensionMetadata {
@@ -625,20 +524,19 @@ mod cmd {
                 )?]);
             }
 
-            if !self.transform.is_empty() {
-                let config =
-                    TransformationConfig::try_from(self.transform.clone()).map_err(|err| {
+            if !self.transforms_line.is_empty() {
+                let config = TransformationConfig::try_from(self.transforms_line.clone()).map_err(
+                    |err| {
                         CliError::InvalidArg(format!("unable to parse `transform` argument: {err}"))
-                    })?;
+                    },
+                )?;
                 return create_smartmodule_list(config);
             }
 
             #[cfg(feature = "producer-file-io")]
-            if let Some(transforms_file) = &self.transforms_file {
-                let config = TransformationConfig::from_file(transforms_file).map_err(|err| {
-                    CliError::InvalidArg(format!(
-                        "unable to process `transforms_file` argument: {err}"
-                    ))
+            if let Some(transforms) = &self.transforms {
+                let config = TransformationConfig::from_file(transforms).map_err(|err| {
+                    CliError::InvalidArg(format!("unable to process `transforms` argument: {err}"))
                 })?;
 
                 return create_smartmodule_list(config);
@@ -646,31 +544,5 @@ mod cmd {
 
             Ok(Vec::new())
         }
-    }
-
-    #[cfg(feature = "stats")]
-    /// Initialize Ctrl-C event handler to print session summary when we are collecting stats
-    async fn init_ctrlc(
-        producer: Arc<TopicProducer>,
-        maybe_stats_bar: Option<ProgressBar>,
-        force_print_summary: bool,
-    ) -> Result<()> {
-        let result = ctrlc::set_handler(move || {
-            fluvio_future::task::run_block_on(async {
-                producer_summary(&producer, maybe_stats_bar.as_ref(), force_print_summary).await;
-            });
-
-            debug!("detected control c, setting end");
-            std::process::exit(0);
-        });
-
-        if let Err(err) = result {
-            return Err(IoError::new(
-                ErrorKind::InvalidData,
-                format!("CTRL-C handler can't be initialized {}", err),
-            )
-            .into());
-        }
-        Ok(())
     }
 }

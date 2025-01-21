@@ -31,10 +31,8 @@ jobs:
       CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
       CLOUD_LOGIN_PW:  ${{ !inputs.target_prod && secrets.ORG_HUB_SA_PASSWD_DEV || secrets.ORG_HUB_SA_PASSWD_PROD }}
     steps:
-      - name: Install Fluvio
-        run: |
-          curl -fsS https://hub.infinyon.cloud/install/install.sh | bash
-          echo "$HOME/.fluvio/bin" >> $GITHUB_PATH
+      - name: Setup Fluvio
+        uses: infinyon/fluvio/.github/actions/setup-fluvio@master
       - name: Install Fluvio SMDK
         run: fluvio install smdk
       - name: Fluvio Login
@@ -42,7 +40,7 @@ jobs:
           fluvio cloud login --email "${{ secrets.ORG_HUB_SA_NAME }}" \
           --password "$CLOUD_LOGIN_PW" \
           ${{ !inputs.target_prod && '--remote' || '' }} ${{ !inputs.target_prod && secrets.ORG_CLOUD_URL_DEV || '' }}
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         id: download-file
         with:
           name: ${{ inputs.artifact-name }}

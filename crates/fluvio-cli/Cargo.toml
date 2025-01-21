@@ -21,7 +21,6 @@ doc = false
 [features]
 default = ["consumer", "k8s", "producer-file-io"]
 consumer = [
-    "atty",
     "ctrlc",
     "content_inspector",
     "fluvio-types",
@@ -38,22 +37,17 @@ smartengine = ["fluvio-smartengine/default"]
 producer-file-io = ["fluvio-cli-common/file-records"]
 
 [dependencies]
-
-async-net = { workspace = true }
+async-channel = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
 bytesize = { workspace = true, features = ['serde'] }
 clap = { workspace = true, features = ["std", "derive", "string", "help", "usage", "env", "error-context"] }
 clap_complete = { workspace = true }
-dirs = { workspace = true }
 indicatif = { workspace = true }
-eyre = { workspace = true }
 sha2 = { workspace = true }
-hex = { workspace = true }
 home = { workspace = true }
 current_platform = { workspace = true }
 comfy-table = { workspace = true }
-atty = { workspace = true, optional = true }
 ctrlc = { workspace = true, optional = true }
 colored = { workspace = true }
 handlebars = { workspace = true }
@@ -64,8 +58,7 @@ tui = { workspace = true, features = ['crossterm'] }
 futures = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 humantime = { workspace = true }
-static_assertions = { workspace = true }
-sysinfo = { workspace = true }
+mimalloc = { workspace = true }
 serde_yaml = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -74,7 +67,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true,  features = ["macros"] }
 tracing = { workspace = true }
 which = { workspace = true }
-url = { workspace = true }
 
 # Fluvio dependencies
 k8-config = { workspace = true, optional = true }
@@ -82,14 +74,15 @@ k8-client = { workspace = true, optional = true }
 k8-types = { workspace = true , features = ["core"] }
 fluvio-cluster = { path = "../fluvio-cluster", default-features = false, features = ["cli"], optional = true }
 
-fluvio = { workspace = true  }
-fluvio-socket = { workspace = true }
+fluvio = { workspace = true }
+fluvio-auth = { workspace = true }
+fluvio-benchmark = { workspace = true }
 fluvio-command = { workspace = true  }
 fluvio-package-index = { workspace = true }
 fluvio-extension-common = { workspace = true,  features = ["target", "installation"] }
 fluvio-channel = { workspace = true }
 fluvio-hub-util = { workspace = true, features = ["connector-cmds"] }
-fluvio-cli-common = { workspace = true }
+fluvio-cli-common = { workspace = true, features = ["serde", "version-cmd"] }
 fluvio-smartengine = { workspace = true,  features = ["transformation"]}
 fluvio-protocol = { workspace = true, features=["record","api"] }
 fluvio-smartmodule = { workspace = true  }
@@ -97,7 +90,7 @@ fluvio-controlplane-metadata = { workspace = true, features = ["smartmodule"] }
 
 # Optional Fluvio dependencies
 fluvio-types = { workspace = true,  optional = true }
-fluvio-future = { workspace = true, features = ["fs", "io", "subscriber", "native2_tls"], optional = true }
+fluvio-future = { workspace = true, features = ["fs", "io", "subscriber", "native_tls"], optional = true }
 fluvio-sc-schema = { workspace = true,  features = ["use_serde"], optional = true }
 fluvio-spu-schema = { workspace = true, optional = true }
 

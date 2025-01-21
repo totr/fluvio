@@ -1,3 +1,5 @@
+//! API call from Spu to SC
+
 use std::io::Error as IoError;
 use std::convert::TryInto;
 
@@ -9,11 +11,11 @@ use fluvio_protocol::bytes::Buf;
 use fluvio_protocol::derive::Encoder;
 use fluvio_protocol::derive::Decoder;
 
+use crate::sc_api::update_mirror::UpdateMirrorStatRequest;
+
 use super::register_spu::RegisterSpuRequest;
 use super::update_lrs::UpdateLrsRequest;
 use super::remove::ReplicaRemovedRequest;
-
-/// API call from Spu to SC
 
 #[repr(u16)]
 #[derive(Eq, PartialEq, Debug, Encoder, Decoder, Clone, Copy)]
@@ -24,6 +26,7 @@ pub enum InternalScKey {
     RegisterSpu = 2000,
     UpdateLrs = 2001,
     ReplicaRemoved = 2002,
+    UpdateMirror = 2003,
 }
 
 /// Request made to Spu from Sc
@@ -35,6 +38,8 @@ pub enum InternalScRequest {
     UpdateLrsRequest(RequestMessage<UpdateLrsRequest>),
     #[fluvio(tag = 2)]
     ReplicaRemovedRequest(RequestMessage<ReplicaRemovedRequest>),
+    #[fluvio(tag = 3)]
+    UpdateMirrorStatRequest(RequestMessage<UpdateMirrorStatRequest>),
 }
 
 impl Default for InternalScRequest {
@@ -61,6 +66,9 @@ impl ApiMessage for InternalScRequest {
             }
             InternalScKey::ReplicaRemoved => {
                 api_decode!(InternalScRequest, ReplicaRemovedRequest, src, header)
+            }
+            InternalScKey::UpdateMirror => {
+                api_decode!(InternalScRequest, UpdateMirrorStatRequest, src, header)
             }
         }
     }

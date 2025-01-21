@@ -17,7 +17,6 @@ use crate::Version;
 use super::ConsumerRecord;
 use super::Record;
 use super::Offset;
-use super::Size;
 
 const ATTR_SCHEMA_PRESENT: i16 = 0x10;
 const ATTR_COMPRESSION_CODEC_MASK: i16 = 0x07;
@@ -148,11 +147,6 @@ impl<R> Batch<R> {
 
         self.last_offset_delta() as usize + 1
     }
-    /// get last offset delta
-    #[deprecated(since = "0.9.2", note = "use last_offset_delta instead")]
-    pub fn get_last_offset_delta(&self) -> Size {
-        self.get_header().last_offset_delta as Size
-    }
 
     pub fn last_offset_delta(&self) -> i32 {
         self.get_header().last_offset_delta
@@ -194,7 +188,6 @@ impl<R> Batch<R> {
     }
 }
 
-#[cfg(feature = "compress")]
 impl TryFrom<Batch<RawRecords>> for Batch {
     type Error = CompressionError;
     fn try_from(batch: Batch<RawRecords>) -> Result<Self, Self::Error> {
@@ -209,7 +202,6 @@ impl TryFrom<Batch<RawRecords>> for Batch {
     }
 }
 
-#[cfg(feature = "compress")]
 impl TryFrom<Batch> for Batch<RawRecords> {
     type Error = CompressionError;
     fn try_from(f: Batch) -> Result<Self, Self::Error> {
@@ -310,20 +302,28 @@ impl Batch {
     }
 }
 
-#[cfg(feature = "compress")]
 impl Batch<RawRecords> {
     pub fn memory_records(&self) -> Result<MemoryRecords, CompressionError> {
-        let compression = self.get_compression()?;
-
         let mut records: MemoryRecords = Default::default();
-        if let Compression::None = compression {
-            records.decode(&mut &self.records.0[..], 0)?;
-        } else {
-            let decompressed = compression
-                .uncompress(&self.records.0[..])?
-                .ok_or(CompressionError::UnreachableError)?;
-            records.decode(&mut &decompressed[..], 0)?;
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "compress")] {
+                let compression = self.get_compression()?;
+
+                if let Compression::None = compression {
+                    records.decode(&mut &self.records.0[..], 0)?;
+                } else {
+
+                    let decompressed = compression
+                        .uncompress(&self.records.0[..])?
+                        .ok_or(CompressionError::UnreachableError)?;
+                    records.decode(&mut &decompressed[..], 0)?;
+                }
+            } else {
+                records.decode(&mut &self.records.0[..], 0)?;
+            }
         }
+
         Ok(records)
     }
 }
@@ -569,7 +569,7 @@ mod test {
         let batch = Batch::<MemoryRecords>::decode_from(&mut Cursor::new(bytes), 0)?;
         println!("batch: {batch:#?}");
 
-        let decoded_record = batch.records.get(0).unwrap();
+        let decoded_record = batch.records.first().unwrap();
         println!("record crc: {}", batch.header.crc);
         assert_eq!(batch.header.crc, 1430948200);
         let b = decoded_record.value.as_ref();
@@ -622,7 +622,7 @@ mod test {
         let batch = Batch::<MemoryRecords>::decode_from(&mut Cursor::new(bytes), 0)?;
         println!("batch: {batch:#?}");
 
-        let decoded_record = batch.records.get(0).unwrap();
+        let decoded_record = batch.records.first().unwrap();
         println!("record crc: {}", batch.header.crc);
         assert_eq!(batch.header.crc, 2943551365);
         let b = decoded_record.value.as_ref();
@@ -660,7 +660,7 @@ mod test {
         assert_eq!(
             batch
                 .records
-                .get(0)
+                .first()
                 .expect("index 0 should exists")
                 .get_header()
                 .get_offset_delta(),
@@ -711,7 +711,7 @@ mod test {
         assert_eq!(
             batch
                 .records
-                .get(0)
+                .first()
                 .expect("index 0 should exists")
                 .get_header()
                 .get_offset_delta(),
@@ -756,7 +756,7 @@ mod test {
         assert_eq!(
             batch
                 .records
-                .get(0)
+                .first()
                 .expect("index 0 should exists")
                 .get_header()
                 .get_offset_delta(),

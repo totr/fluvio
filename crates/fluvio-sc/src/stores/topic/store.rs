@@ -30,7 +30,7 @@ impl<C: MetadataItem> TopicMd<C> for TopicMetadata<C>
 where
     C: MetadataItem + Send + Sync,
 {
-    /// create new partitions from my replica map if it doesn't exists
+    /// create new partitions from the replica map if it doesn't exists
     async fn create_new_partitions(
         &self,
         partition_store: &PartitionLocalStore<C>,
@@ -38,11 +38,14 @@ where
         let mut partitions = vec![];
         let replica_map = &self.status.replica_map;
         trace!(?replica_map, "creating new partitions for topic");
+        let store = partition_store.read().await;
         for (idx, replicas) in replica_map.iter() {
+            let mirror = self.status.mirror_map.get(idx);
+
             let replica_key = ReplicaKey::new(self.key(), *idx);
 
-            let partition_spec = PartitionSpec::from_replicas(replicas.clone(), &self.spec);
-            if !partition_store.contains_key(&replica_key).await {
+            let partition_spec = PartitionSpec::from_replicas(replicas.clone(), &self.spec, mirror);
+            if !store.contains_key(&replica_key) {
                 debug!(?replica_key, ?partition_spec, "creating new partition");
                 partitions.push(
                     MetadataStoreObject::with_spec(replica_key, partition_spec)
@@ -52,6 +55,7 @@ where
                 debug!(?replica_key, "partition already exists");
             }
         }
+        drop(store);
         partitions
     }
 }
@@ -107,8 +111,17 @@ where
 #[cfg(test)]
 mod test {
     use fluvio_controlplane_metadata::topic::{TopicStatus, TopicResolution};
+    use fluvio_protocol::record::ReplicaKey;
+    use fluvio_sc_schema::{
+        partition::{PartitionSpec, PartitionStatus},
+        store::MetadataStoreObject,
+        topic::TopicSpec,
+    };
 
-    use crate::stores::topic::{DefaultTopicMd, DefaultTopicLocalStore};
+    use crate::stores::{
+        partition::DefaultPartitionStore,
+        topic::{DefaultTopicLocalStore, DefaultTopicMd, TopicMd},
+    };
 
     #[test]
     fn test_topic_replica_map() {
@@ -151,7 +164,7 @@ mod test {
         topic1
             .status
             .set_replica_map(topic2.status.replica_map.clone());
-        topic1.status.reason = topic2.status.reason.clone();
+        topic1.status.reason.clone_from(&topic2.status.reason);
         topic1.status.resolution = topic2.status.resolution.clone();
 
         // topics should be identical
@@ -215,5 +228,32 @@ mod test {
         }
 
         assert_eq!(pending_state_names, expected);
+    }
+
+    #[fluvio_future::test]
+    async fn test_partitions_from_replicas() {
+        // already exist a partition with spu leader 0 and replica 1
+        let partition_stored = MetadataStoreObject::<PartitionSpec, u32>::new(
+            ReplicaKey::new("topic-1", 0_u32),
+            PartitionSpec::new(0, vec![0, 1]),
+            PartitionStatus::default(),
+        );
+
+        // create topic with 2 partitions (but already exist one)
+        let spec: TopicSpec = (2, 2, false).into();
+        let key = "topic-1";
+        let status = TopicStatus::new(
+            TopicResolution::Provisioned,
+            vec![vec![0, 1], vec![1, 2]],
+            "".to_owned(),
+        );
+        let topic = MetadataStoreObject::<TopicSpec, u32>::new(key, spec, status);
+        let partition_store = DefaultPartitionStore::bulk_new(vec![partition_stored]);
+
+        let partitions = topic.create_new_partitions(&partition_store).await;
+
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].key, ReplicaKey::new("topic-1", 1_u32));
+        assert_eq!(partitions[0].spec.leader, 1);
     }
 }

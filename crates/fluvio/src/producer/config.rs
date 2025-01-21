@@ -1,4 +1,4 @@
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -9,16 +9,18 @@ use fluvio_spu_schema::Isolation;
 use fluvio_spu_schema::server::smartmodule::SmartModuleInvocation;
 
 use fluvio_compression::Compression;
+use fluvio_types::PartitionId;
 use serde::{Serialize, Deserialize};
 
 use crate::producer::partitioning::{Partitioner, SiphashRoundRobinPartitioner};
-#[cfg(feature = "stats")]
-use crate::stats::ClientStatsDataCollect;
 
-const DEFAULT_LINGER_MS: u64 = 100;
+use super::partitioning::SpecificPartitioner;
+
+const DEFAULT_LINGER_MS: u64 = 0;
 const DEFAULT_TIMEOUT_MS: u64 = 1500;
 const DEFAULT_BATCH_SIZE_BYTES: usize = 16_384;
 const DEFAULT_BATCH_QUEUE_SIZE: usize = 100;
+const DEFAULT_MAX_REQUEST_SIZE: usize = 1_048_576;
 
 const DEFAULT_RETRIES_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_INITIAL_DELAY: Duration = Duration::from_millis(20);
@@ -27,6 +29,10 @@ const DEFAULT_MAX_RETRIES: usize = 4;
 
 fn default_batch_size() -> usize {
     DEFAULT_BATCH_SIZE_BYTES
+}
+
+fn default_max_request_size() -> usize {
+    DEFAULT_MAX_REQUEST_SIZE
 }
 
 fn default_batch_queue_size() -> usize {
@@ -49,25 +55,30 @@ fn default_isolation() -> Isolation {
     Isolation::default()
 }
 
-#[cfg(feature = "stats")]
-fn default_stats_collect() -> ClientStatsDataCollect {
-    ClientStatsDataCollect::default()
-}
-
 fn default_delivery() -> DeliverySemantic {
     DeliverySemantic::default()
+}
+
+// This is needed only to bypass the partitioner property when debugging
+impl fmt::Debug for Box<dyn Partitioner + Send + Sync> {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
 }
 
 /// Options used to adjust the behavior of the Producer.
 /// Create this struct with [`TopicProducerConfigBuilder`].
 ///
 /// Create a producer with a custom config with [`crate::Fluvio::topic_producer_with_config()`].
-#[derive(Builder)]
+#[derive(Debug, Builder)]
 #[builder(pattern = "owned")]
 pub struct TopicProducerConfig {
     /// Maximum amount of bytes accumulated by the records before sending the batch.
     #[builder(default = "default_batch_size()")]
     pub(crate) batch_size: usize,
+    /// Maximum amount of bytes that the server is allowed to process in a single request.
+    #[builder(default = "default_max_request_size()")]
+    pub(crate) max_request_size: usize,
     /// Maximum amount of batches waiting in the queue before sending to the SPU.
     #[builder(default = "default_batch_queue_size()")]
     pub(crate) batch_queue_size: usize,
@@ -82,6 +93,7 @@ pub struct TopicProducerConfig {
     /// If there is a topic level compression and it is not compatible with this setting, the producer
     /// initialization will fail.
     #[builder(setter(into, strip_option), default)]
+    #[allow(dead_code)]
     pub(crate) compression: Option<Compression>,
 
     /// Max time duration that the server is allowed to process the batch.
@@ -94,11 +106,6 @@ pub struct TopicProducerConfig {
     /// [`Isolation::ReadUncommitted`] just waits for the leader to accept the message.
     #[builder(default = "default_isolation()")]
     pub(crate) isolation: Isolation,
-
-    #[cfg(feature = "stats")]
-    /// Collect resource and data transfer stats used by Fluvio producer
-    #[builder(default = "default_stats_collect()")]
-    pub(crate) stats_collect: ClientStatsDataCollect,
 
     /// Delivery guarantees that producer must respect.
     /// [`DeliverySemantic::AtMostOnce`] - send records without waiting from response. `Fire and forget`
@@ -113,19 +120,61 @@ pub struct TopicProducerConfig {
     pub(crate) smartmodules: Vec<SmartModuleInvocation>,
 }
 
+impl TopicProducerConfigBuilder {
+    pub fn set_specific_partitioner(self, partition_id: PartitionId) -> Self {
+        self.partitioner(Box::new(SpecificPartitioner::new(partition_id)))
+    }
+}
+
+impl TopicProducerConfig {
+    pub fn linger(&self) -> Duration {
+        self.linger
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub fn max_request_size(&self) -> usize {
+        self.max_request_size
+    }
+
+    pub fn batch_queue_size(&self) -> usize {
+        self.batch_queue_size
+    }
+
+    pub fn compression(&self) -> Option<Compression> {
+        self.compression
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn isolation(&self) -> Isolation {
+        self.isolation
+    }
+
+    pub fn delivery_semantic(&self) -> DeliverySemantic {
+        self.delivery_semantic
+    }
+
+    pub fn smartmodules(&self) -> &Vec<SmartModuleInvocation> {
+        &self.smartmodules
+    }
+}
+
 impl Default for TopicProducerConfig {
     fn default() -> Self {
         Self {
             linger: default_linger_duration(),
             batch_size: default_batch_size(),
+            max_request_size: default_max_request_size(),
             batch_queue_size: default_batch_queue_size(),
             partitioner: default_partitioner(),
             compression: None,
             timeout: default_timeout(),
             isolation: default_isolation(),
-
-            #[cfg(feature = "stats")]
-            stats_collect: default_stats_collect(),
             delivery_semantic: default_delivery(),
             smartmodules: vec![],
         }

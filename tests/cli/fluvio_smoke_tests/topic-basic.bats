@@ -20,6 +20,9 @@ setup_file() {
     TOPIC_NAME_REPLICA=$(random_string)
     export TOPIC_NAME_REPLICA
 
+    TOPIC_NAME_SYSTEM=$(random_string)
+    export TOPIC_NAME_SYSTEM
+
     DEDUP_FILTER_NAME="dedup-filter"
     export DEDUP_FILTER_NAME
 
@@ -43,17 +46,17 @@ deduplication:
     age: 1m
   filter:
     transform:
-      uses: $DEDUP_FILTER_NAME  
+      uses: $DEDUP_FILTER_NAME
 EOF
 
-    run timeout 15s "$FLUVIO_BIN" sm create --wasm-file smartmodule/examples/target/wasm32-unknown-unknown/release/fluvio_smartmodule_filter.wasm "$DEDUP_FILTER_NAME"
+    run timeout 15s "$FLUVIO_BIN" sm create --wasm-file smartmodule/examples/target/wasm32-wasip1/release-lto/fluvio_smartmodule_filter.wasm "$DEDUP_FILTER_NAME"
     assert_success
 }
 
 # Create topic
 @test "Create a topic" {
     debug_msg "Topic name: $TOPIC_NAME"
-    run timeout 15s "$FLUVIO_BIN" topic create "$TOPIC_NAME" 
+    run timeout 15s "$FLUVIO_BIN" topic create "$TOPIC_NAME"
     #debug_msg "command $BATS_RUN_COMMAND" # This doesn't do anything.
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
@@ -106,7 +109,7 @@ EOF
 # Describe topic
 @test "Describe a topic" {
     debug_msg "Topic name: $TOPIC_NAME"
-    run timeout 15s "$FLUVIO_BIN" topic describe "$TOPIC_NAME" 
+    run timeout 15s "$FLUVIO_BIN" topic describe "$TOPIC_NAME"
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
     assert_success
@@ -115,16 +118,16 @@ EOF
 # Delete topic
 @test "Delete a topic" {
     debug_msg "Topic name: $TOPIC_NAME"
-    run timeout 15s "$FLUVIO_BIN" topic delete "$TOPIC_NAME" 
+    run timeout 15s "$FLUVIO_BIN" topic delete "$TOPIC_NAME"
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
     assert_success
 }
 
-# Delete topic - Negative test 
+# Delete topic - Negative test
 @test "Attempt to delete a topic that doesn't exist" {
     debug_msg "Topic name: $TOPIC_NAME"
-    run timeout 15s "$FLUVIO_BIN" topic delete "$TOPIC_NAME" 
+    run timeout 15s "$FLUVIO_BIN" topic delete "$TOPIC_NAME"
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
     assert_failure
@@ -196,7 +199,7 @@ EOF
 # Create topic from config file
 @test "Create a topic from config file" {
     debug_msg "Topic config file: $TOPIC_CONFIG_PATH"
-    run timeout 15s "$FLUVIO_BIN" topic create --config "$TOPIC_CONFIG_PATH" 
+    run timeout 15s "$FLUVIO_BIN" topic create --config "$TOPIC_CONFIG_PATH"
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
     assert_success
@@ -211,11 +214,30 @@ EOF
         skip "don't run on cluster stable version"
     fi
     debug_msg "Topic name: $TOPIC_NAME"
-    run timeout 15s "$FLUVIO_BIN" topic describe "$TOPIC_NAME" 
+    run timeout 15s "$FLUVIO_BIN" topic describe "$TOPIC_NAME"
     debug_msg "status: $status"
     debug_msg "output: ${lines[0]}"
     assert_success
     assert_output --partial "Deduplication Filter:$DEDUP_FILTER_NAME"
     assert_output --partial "Deduplication Count Bound:10"
     assert_output --partial "Deduplication Age Bound:1"
+}
+
+# Create a system topic
+@test "Create a system topic" {
+    if [ "$FLUVIO_CLI_RELEASE_CHANNEL" == "stable" ]; then
+        skip "don't run on fluvio cli stable version"
+    fi
+    if [ "$FLUVIO_CLUSTER_RELEASE_CHANNEL" == "stable" ]; then
+        skip "don't run on cluster stable version"
+    fi
+    debug_msg "Topic name: $TOPIC_NAME_SYSTEM"
+    run timeout 15s "$FLUVIO_BIN" topic create "$TOPIC_NAME_SYSTEM" --system
+    assert_output --partial "topic "\"$TOPIC_NAME_SYSTEM"\" created"
+    assert_success
+
+    # Check if the topic is a system topic
+    run bash -c 'timeout 15s "$FLUVIO_BIN" partition list --system | grep "$TOPIC_NAME_SYSTEM"'
+    assert_line --partial --index 0 "$TOPIC_NAME_SYSTEM"
+    assert_success
 }

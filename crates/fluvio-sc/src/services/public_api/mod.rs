@@ -7,10 +7,13 @@ mod partition;
 mod api_version;
 mod create;
 mod delete;
+mod update;
 mod list;
 mod watch;
 mod tableformat;
 mod derivedstream;
+mod mirror;
+mod mirroring;
 
 pub use server::start_public_server;
 

@@ -1,8 +1,10 @@
 mod spec;
 mod status;
 mod deduplication;
+mod update;
 pub mod config;
 
+pub use self::update::*;
 pub use self::spec::*;
 pub use self::status::*;
 pub use self::deduplication::*;
@@ -11,8 +13,6 @@ pub const PENDING_REASON: &str = "waiting for live spus";
 
 #[cfg(feature = "k8")]
 mod k8;
-#[cfg(feature = "k8")]
-pub use k8::*;
 
 mod metadata {
 

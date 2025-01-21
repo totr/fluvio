@@ -1,17 +1,18 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use async_lock::Mutex;
 use async_channel::Sender;
+use async_lock::RwLock;
 use tracing::trace;
-
-use fluvio_future::sync::Condvar;
 use futures_util::future::{BoxFuture, Either, Shared};
 use futures_util::{FutureExt, ready};
+
+use fluvio_future::sync::{Mutex, MutexGuard};
+use fluvio_future::sync::Condvar;
 use fluvio_protocol::record::Batch;
 use fluvio_compression::Compression;
 use fluvio_protocol::record::Offset;
@@ -26,7 +27,7 @@ use crate::producer::ProducerError;
 use crate::error::Result;
 
 use super::event::EventHandler;
-use super::memory_batch::MemoryBatch;
+use super::memory_batch::{MemoryBatch, MemoryBatchStatus};
 
 const RECORD_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -54,28 +55,43 @@ impl BatchesDeque {
 /// The batches are separated by PartitionId
 pub(crate) struct RecordAccumulator {
     batch_size: usize,
+    max_request_size: usize,
     queue_size: usize,
-    batches: Arc<Vec<BatchHandler>>,
+    batches: Arc<RwLock<HashMap<PartitionId, BatchHandler>>>,
     compression: Compression,
 }
 
 impl RecordAccumulator {
     pub(crate) fn new(
         batch_size: usize,
+        max_request_size: usize,
         queue_size: usize,
         partition_n: PartitionCount,
         compression: Compression,
     ) -> Self {
-        let mut batches = Vec::with_capacity(partition_n as usize);
-        for _ in 0..batches.capacity() {
-            batches.push((BatchEvents::shared(), BatchesDeque::shared()));
-        }
+        let batches = (0..partition_n)
+            .map(|p| (p, (BatchEvents::shared(), BatchesDeque::shared())))
+            .collect::<HashMap<_, _>>();
         Self {
-            batches: Arc::new(batches),
+            batches: Arc::new(RwLock::new(batches)),
+            max_request_size,
             batch_size,
             compression,
             queue_size,
         }
+    }
+
+    pub(crate) async fn add_partition(
+        &self,
+        partition_id: PartitionId,
+        value: (Arc<BatchEvents>, Arc<BatchesDeque>),
+    ) -> BatchHandler {
+        self.batches
+            .write()
+            .await
+            .insert(partition_id, value.clone());
+
+        value
     }
 
     /// Add a record to the accumulator.
@@ -84,11 +100,61 @@ impl RecordAccumulator {
         record: Record,
         partition_id: PartitionId,
     ) -> Result<PushRecord, ProducerError> {
-        let (batch_events, batches_lock) = self
-            .batches
-            .get(partition_id as usize)
+        let batches_lock = self.batches.read().await;
+        let (batch_events, batches_lock) = batches_lock
+            .get(&partition_id)
             .ok_or(ProducerError::PartitionNotFound(partition_id))?;
 
+        // Wait for space in the batch queue
+        let mut batches = self.wait_for_space(batches_lock).await?;
+
+        // If the last batch is not full, push the record to it
+        if let Some(batch) = batches.back_mut() {
+            match batch.push_record(record) {
+                Ok(ProduceBatchStatus::Added(push_record)) => {
+                    if batch.is_full() {
+                        batch_events.notify_batch_full().await;
+                    }
+                    return Ok(PushRecord::new(
+                        push_record.into_future_record_metadata(partition_id),
+                    ));
+                }
+                Ok(ProduceBatchStatus::NotAdded(record)) => {
+                    if batch.is_full() {
+                        batch_events.notify_batch_full().await;
+                    }
+
+                    // Create and push a new batch if needed
+                    let push_record = self
+                        .create_and_new_batch(batch_events, &mut batches, record, 1)
+                        .await?;
+
+                    return Ok(PushRecord::new(
+                        push_record.into_future_record_metadata(partition_id),
+                    ));
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+
+        trace!(partition_id, "Creating a new batch");
+
+        // Create and push a new batch if needed
+        let push_record = self
+            .create_and_new_batch(batch_events, &mut batches, record, 1)
+            .await?;
+
+        Ok(PushRecord::new(
+            push_record.into_future_record_metadata(partition_id),
+        ))
+    }
+
+    async fn wait_for_space<'a>(
+        &self,
+        batches_lock: &'a Arc<BatchesDeque>,
+    ) -> Result<MutexGuard<'a, VecDeque<ProducerBatch>>, ProducerError> {
         let mut batches = batches_lock.batches.lock().await;
         if batches.len() >= self.queue_size {
             let (guard, wait_result) = batches_lock
@@ -102,46 +168,53 @@ impl RecordAccumulator {
             }
             batches = guard;
         }
-        if let Some(batch) = batches.back_mut() {
-            if let Some(push_record) = batch.push_record(record.clone()) {
-                if batch.is_full() {
-                    batch_events.notify_batch_full().await;
-                }
-                return Ok(PushRecord::new(
-                    push_record.into_future_record_metadata(partition_id),
-                ));
-            } else {
-                batch_events.notify_batch_full().await;
-            }
+        Ok(batches)
+    }
+
+    async fn create_and_new_batch(
+        &self,
+        batch_events: &BatchEvents,
+        batches: &mut VecDeque<ProducerBatch>,
+        record: Record,
+        attempts: usize,
+    ) -> Result<PartialFutureRecordMetadata, ProducerError> {
+        if attempts > 2 {
+            // This should never happen, but if it does, we should stop the recursion
+            return Err(ProducerError::Internal(
+                "Attempts exceeded while creating a new batch".to_string(),
+            ));
         }
 
-        trace!(
-            partition_id,
-            "Batch is full. Creating a new batch for partition"
-        );
-
-        let mut batch = ProducerBatch::new(self.batch_size, self.compression);
+        let mut batch =
+            ProducerBatch::new(self.max_request_size, self.batch_size, self.compression);
 
         match batch.push_record(record) {
-            Some(push_record) => {
+            Ok(ProduceBatchStatus::Added(push_record)) => {
                 batch_events.notify_new_batch().await;
-
                 if batch.is_full() {
                     batch_events.notify_batch_full().await;
                 }
 
                 batches.push_back(batch);
-
-                Ok(PushRecord::new(
-                    push_record.into_future_record_metadata(partition_id),
-                ))
+                Ok(push_record)
             }
-            None => Err(ProducerError::RecordTooLarge(self.batch_size)),
+            Ok(ProduceBatchStatus::NotAdded(record)) => {
+                batch_events.notify_new_batch().await;
+                if batch.is_full() {
+                    batch_events.notify_batch_full().await;
+                }
+
+                batches.push_back(batch);
+                // Box the future to avoid infinite size due to recursion
+                Box::pin(self.create_and_new_batch(batch_events, batches, record, attempts + 1))
+                    .await
+            }
+            Err(err) => Err(err),
         }
     }
 
-    pub(crate) fn batches(&self) -> Arc<Vec<BatchHandler>> {
-        self.batches.clone()
+    pub(crate) async fn batches(&self) -> HashMap<PartitionId, BatchHandler> {
+        self.batches.read().await.clone()
     }
 }
 
@@ -156,16 +229,21 @@ where {
     }
 }
 
+enum ProduceBatchStatus {
+    Added(PartialFutureRecordMetadata),
+    NotAdded(Record),
+}
+
 pub(crate) struct ProducerBatch {
     pub(crate) notify: Sender<ProducePartitionResponseFuture>,
     batch_metadata: Arc<BatchMetadata>,
     batch: MemoryBatch,
 }
 impl ProducerBatch {
-    fn new(write_limit: usize, compression: Compression) -> Self {
+    fn new(write_limit: usize, batch_limit: usize, compression: Compression) -> Self {
         let (sender, receiver) = async_channel::bounded(1);
         let batch_metadata = Arc::new(BatchMetadata::new(receiver));
-        let batch = MemoryBatch::new(write_limit, compression);
+        let batch = MemoryBatch::new(write_limit, batch_limit, compression);
 
         Self {
             notify: sender,
@@ -177,13 +255,13 @@ impl ProducerBatch {
     /// Add a record to the batch.
     /// Return ProducerError::BatchFull if record does not fit in the batch, so
     /// the RecordAccumulator can create more batches if needed.
-    fn push_record(&mut self, record: Record) -> Option<PartialFutureRecordMetadata> {
+    fn push_record(&mut self, record: Record) -> Result<ProduceBatchStatus, ProducerError> {
         match self.batch.push_record(record) {
-            None => None,
-            Some(relative_offset) => Some(PartialFutureRecordMetadata::new(
-                relative_offset,
-                self.batch_metadata.clone(),
+            Ok(MemoryBatchStatus::Added(offset)) => Ok(ProduceBatchStatus::Added(
+                PartialFutureRecordMetadata::new(offset, self.batch_metadata.clone()),
             )),
+            Ok(MemoryBatchStatus::NotAdded(record)) => Ok(ProduceBatchStatus::NotAdded(record)),
+            Err(err) => Err(err),
         }
     }
 
@@ -313,6 +391,7 @@ mod test {
 
         // Producer batch that can store three instances of Record::from(("key", "value"))
         let mut pb = ProducerBatch::new(
+            1_048_576,
             size * 3
                 + 1
                 + Batch::<RawRecords>::default().write_size(0)
@@ -320,13 +399,25 @@ mod test {
             Compression::None,
         );
 
-        assert!(pb.push_record(record.clone()).is_some());
-        assert!(pb.push_record(record.clone()).is_some());
-        assert!(pb.push_record(record.clone()).is_some());
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
 
         assert!(!pb.is_full());
 
-        assert!(pb.push_record(record).is_none());
+        assert!(matches!(
+            pb.push_record(record),
+            Ok(ProduceBatchStatus::NotAdded(_))
+        ));
     }
 
     #[test]
@@ -336,19 +427,66 @@ mod test {
 
         // Producer batch that can store three instances of Record::from(("key", "value"))
         let mut pb = ProducerBatch::new(
+            1_048_576,
             size * 3
                 + Batch::<RawRecords>::default().write_size(0)
                 + Vec::<RawRecords>::default().write_size(0),
             Compression::None,
         );
 
-        assert!(pb.push_record(record.clone()).is_some());
-        assert!(pb.push_record(record.clone()).is_some());
-        assert!(pb.push_record(record.clone()).is_some());
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
 
         assert!(pb.is_full());
 
-        assert!(pb.push_record(record).is_none());
+        assert!(matches!(
+            pb.push_record(record),
+            Ok(ProduceBatchStatus::NotAdded(_))
+        ));
+    }
+
+    #[test]
+    fn test_producer_write_limit() {
+        let record = Record::from(("key", "value"));
+        let size = record.write_size(0);
+
+        // Producer batch that can store three instances of Record::from(("key", "value"))
+        let mut pb = ProducerBatch::new(
+            size * 3
+                + Batch::<RawRecords>::default().write_size(0)
+                + Vec::<RawRecords>::default().write_size(0),
+            size * 3
+                + Batch::<RawRecords>::default().write_size(0)
+                + Vec::<RawRecords>::default().write_size(0),
+            Compression::None,
+        );
+
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+        assert!(matches!(
+            pb.push_record(record.clone()),
+            Ok(ProduceBatchStatus::Added(_))
+        ));
+
+        assert!(pb.is_full());
+
+        assert!(pb.push_record(record).is_err());
     }
 
     #[fluvio_future::test]
@@ -360,6 +498,7 @@ mod test {
             size * 3
                 + Batch::<RawRecords>::default().write_size(0)
                 + Vec::<RawRecords>::default().write_size(0),
+            1_048_576,
             10,
             1,
             Compression::None,
@@ -368,7 +507,8 @@ mod test {
 
         let batches = accumulator
             .batches()
-            .get(0)
+            .await
+            .get(&0)
             .expect("failed to get batch info")
             .0
             .clone();
@@ -407,6 +547,37 @@ mod test {
             async_std::future::timeout(timeout, batches.listen_batch_full())
                 .await
                 .is_ok()
+        );
+
+        let record_2 = Record::from(("key_2", "value_2"));
+        let batch_events = BatchEvents::shared();
+        let batches_deque = BatchesDeque::shared();
+        accumulator
+            .add_partition(1, (batch_events.clone(), batches_deque.clone()))
+            .await;
+        accumulator
+            .push_record(record_2.clone(), 1)
+            .await
+            .expect("failed push");
+
+        let batches = accumulator
+            .batches()
+            .await
+            .get(&1)
+            .expect("failed to get batch info")
+            .0
+            .clone();
+
+        assert!(
+            async_std::future::timeout(timeout, batches.listen_new_batch())
+                .await
+                .is_ok()
+        );
+
+        assert!(
+            async_std::future::timeout(timeout, batches.listen_batch_full())
+                .await
+                .is_err()
         );
     }
 

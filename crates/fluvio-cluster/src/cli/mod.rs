@@ -10,6 +10,7 @@ use tracing::debug;
 mod group;
 mod spu;
 mod start;
+mod resume;
 mod delete;
 mod util;
 mod check;
@@ -20,6 +21,7 @@ mod shutdown;
 mod upgrade;
 
 use start::StartOpt;
+use resume::ResumeOpt;
 use delete::DeleteOpt;
 use check::CheckOpt;
 use group::SpuGroupCmd;
@@ -46,6 +48,10 @@ pub enum ClusterCmd {
     /// Install Fluvio cluster
     #[command(name = "start")]
     Start(Box<StartOpt>),
+
+    /// Resume Fluvio cluster
+    #[command(name = "resume")]
+    Resume(ResumeOpt),
 
     /// Upgrades an already-started Fluvio cluster
     #[command(name = "upgrade")]
@@ -121,6 +127,9 @@ impl ClusterCmd {
 
                 start.process(platform_version, false).await?;
             }
+            Self::Resume(opt) => {
+                opt.process(platform_version).await?;
+            }
             Self::Upgrade(mut upgrade) => {
                 if let Ok(tag_strategy_value) = std::env::var(FLUVIO_IMAGE_TAG_STRATEGY) {
                     let tag_strategy = ImageTagStrategy::from_str(&tag_strategy_value, true)
@@ -166,9 +175,9 @@ impl ClusterCmd {
     }
 }
 
-pub(crate) fn get_installation_type() -> Result<InstallationType, ClusterCliError> {
+pub(crate) fn get_installation_type() -> Result<(InstallationType, ConfigFile)> {
     let config = ConfigFile::load_default_or_new()?;
-    Ok(InstallationType::load_or_default(
-        config.config().current_cluster()?,
-    ))
+    let fc = config.config().current_cluster()?;
+    let itype = InstallationType::load(fc);
+    Ok((itype, config))
 }

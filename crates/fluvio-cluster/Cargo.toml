@@ -37,7 +37,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 futures-util = { workspace = true }
-futures-channel = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["macros"] }
 once_cell = { workspace = true }
 which = {workspace = true }
@@ -59,7 +58,7 @@ duct = { workspace = true, optional = true }
 comfy-table = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 tar = { workspace = true ,  optional = true }
-sysinfo = { workspace = true, default-features = false }
+sysinfo = { workspace = true, default-features = false, features = ["system", "network", "disk"] }
 
 
 # External Fluvio dependencies
@@ -78,6 +77,8 @@ fluvio-controlplane-metadata = { workspace = true,  features = ["k8",] }
 fluvio-sc-schema = { workspace = true  }
 fluvio-types = { workspace = true  }
 fluvio-channel = { workspace = true  }
+fluvio-stream-dispatcher = { workspace = true, features = ["k8", "local"]}
+dialoguer.workspace = true
 
 [dev-dependencies]
 fluvio-future = { workspace = true, features = ["task", "fixture"] }

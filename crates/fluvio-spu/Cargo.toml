@@ -28,28 +28,23 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["std", "derive", "env"]}
 thiserror = { workspace = true }
-nix = { workspace = true, features = ["uio"]}
-toml = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 async-trait = { workspace = true }
 serde = { workspace = true,  features = ['derive'] }
 serde_json = { workspace = true }
-regex = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 async-channel = { workspace = true }
-async-rwlock = { workspace = true }
 async-lock = { workspace = true }
-event-listener = { workspace = true }
 async-io = { workspace = true }
-async-net = { workspace = true }
 adaptive_backoff = { workspace = true }
 once_cell = { workspace = true }
 sysinfo = { workspace = true }
 chrono = { workspace = true }
-
+mimalloc = { workspace = true }
 
 # Fluvio dependencies
 fluvio = { workspace = true }
+fluvio-auth = { workspace = true }
 fluvio-types = { workspace = true, features = ["events"] }
 fluvio-storage = { workspace = true, features = ["iterators"] }
 fluvio-compression = { workspace = true }
@@ -66,8 +61,9 @@ fluvio-future = { workspace = true,features = [
     "openssl_tls",
     "zero_copy",
 ] }
-fluvio-smartengine = { workspace = true, optional = true }
+fluvio-smartengine = { workspace = true, optional = true, features = ["engine"] }
 fluvio-smartmodule = { workspace = true}
+fluvio-kv-storage = { workspace = true}
 
 [dev-dependencies]
 once_cell = { workspace = true }

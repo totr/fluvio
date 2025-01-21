@@ -7,9 +7,9 @@ use std::hash::Hash;
 
 use tracing::trace;
 use tracing::{debug, error};
-use async_rwlock::RwLock;
-use async_rwlock::RwLockReadGuard;
-use async_rwlock::RwLockWriteGuard;
+use async_lock::RwLock;
+use async_lock::RwLockReadGuard;
+use async_lock::RwLockWriteGuard;
 
 use crate::core::{MetadataItem, Spec};
 
@@ -74,7 +74,7 @@ where
 
     /// Read guard
     #[inline(always)]
-    pub async fn read<'a>(
+    pub async fn read(
         &'_ self,
     ) -> RwLockReadGuard<'_, DualEpochMap<S::IndexKey, MetadataStoreObject<S, C>>> {
         self.store.read().await
@@ -82,7 +82,7 @@ where
 
     /// write guard, this is private, use sync API to make changes
     #[inline(always)]
-    async fn write<'a>(
+    async fn write(
         &'_ self,
     ) -> RwLockWriteGuard<'_, DualEpochMap<S::IndexKey, MetadataStoreObject<S, C>>> {
         self.store.write().await
@@ -100,22 +100,19 @@ where
     }
 
     /// copy of the value
-    pub async fn value<K: ?Sized>(
-        &self,
-        key: &K,
-    ) -> Option<DualEpochCounter<MetadataStoreObject<S, C>>>
+    pub async fn value<K>(&self, key: &K) -> Option<DualEpochCounter<MetadataStoreObject<S, C>>>
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.get(key).cloned()
     }
 
     /// copy spec
-    pub async fn spec<K: ?Sized>(&self, key: &K) -> Option<S>
+    pub async fn spec<K>(&self, key: &K) -> Option<S>
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.get(key).map(|value| value.spec.clone())
     }
@@ -135,10 +132,10 @@ where
         }
     }
 
-    pub async fn contains_key<K: ?Sized>(&self, key: &K) -> bool
+    pub async fn contains_key<K>(&self, key: &K) -> bool
     where
         S::IndexKey: Borrow<K>,
-        K: Eq + Hash,
+        K: ?Sized + Eq + Hash,
     {
         self.read().await.contains_key(key)
     }
@@ -667,11 +664,11 @@ mod test_notify {
     use std::sync::atomic::{AtomicI64, AtomicBool};
     use std::sync::atomic::Ordering::SeqCst;
 
-    use async_std::task::JoinHandle;
     use tokio::select;
     use tracing::debug;
 
     use fluvio_future::task::spawn;
+    use fluvio_future::task::JoinHandle;
     use fluvio_future::timer::sleep;
 
     use crate::core::{Spec, MetadataItem};

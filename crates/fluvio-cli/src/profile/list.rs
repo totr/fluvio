@@ -55,14 +55,16 @@ impl TableOutputHandler for ListConfig<'_> {
     }
 
     fn content(&self) -> Vec<Row> {
-        self.0
-            .profile
+        let mut profile_names = self.0.profile.keys().collect::<Vec<_>>();
+        profile_names.sort();
+        profile_names
             .iter()
-            .map(|(profile_name, profile)| {
+            .filter_map(|profile_name| {
+                let profile = self.0.profile.get(profile_name.as_str())?;
                 let active = self
                     .0
                     .current_profile_name()
-                    .map(|it| it == profile_name)
+                    .map(|it| it == profile_name.as_str())
                     .map(|active| if active { "*" } else { "" })
                     .unwrap_or("");
 
@@ -74,12 +76,12 @@ impl TableOutputHandler for ListConfig<'_> {
                             &*profile.cluster,
                             &*it.endpoint,
                             format_tls(&it.tls),
-                            InstallationType::load_or_default(it).to_string(),
+                            InstallationType::load(it).to_string(),
                         )
                     })
                     .unwrap_or(("", "", "", String::new()));
-
-                Row::from([active, profile_name, cluster, addr, tls, &installation])
+                let row = Row::from([active, profile_name, cluster, addr, tls, &installation]);
+                Some(row)
             })
             .collect()
     }

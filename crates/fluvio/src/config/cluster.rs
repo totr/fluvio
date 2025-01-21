@@ -48,6 +48,14 @@ impl FluvioConfig {
         Ok(cluster_config.to_owned())
     }
 
+    /// get cluster config from profile
+    /// if profile is not found, return None
+    pub fn load_with_profile(profile_name: &str) -> Result<Option<Self>, FluvioError> {
+        let config_file = ConfigFile::load_default_or_new()?;
+        let cluster_config = config_file.config().cluster_with_profile(profile_name);
+        Ok(cluster_config.cloned())
+    }
+
     /// Create a new cluster configuration with no TLS.
     pub fn new(addr: impl Into<String>) -> Self {
         Self {
@@ -91,10 +99,14 @@ impl FluvioConfig {
 
         Ok(())
     }
+
+    pub fn has_metadata(&self, name: &str) -> bool {
+        self.metadata.get(name).is_some()
+    }
 }
 
 impl TryFrom<FluvioConfig> for fluvio_socket::ClientConfig {
-    type Error = std::io::Error;
+    type Error = anyhow::Error;
     fn try_from(config: FluvioConfig) -> Result<Self, Self::Error> {
         let connector = fluvio_future::net::DomainConnector::try_from(config.tls.clone())?;
         Ok(Self::new(
@@ -107,6 +119,8 @@ impl TryFrom<FluvioConfig> for fluvio_socket::ClientConfig {
 
 #[cfg(test)]
 mod test_metadata {
+    use fluvio_types::config_file::SaveLoadConfig;
+
     use serde::{Deserialize, Serialize};
     use crate::config::{Config, ConfigFile};
 
@@ -122,7 +136,7 @@ endpoint = "127.0.0.1:9003"
 [cluster.local.metadata.custom]
 name = "foo"
 "#;
-        let profile: Config = toml::de::from_str(toml).unwrap();
+        let profile = Config::load_str(toml).unwrap();
         let config = profile.cluster("local").unwrap();
 
         #[derive(Deserialize, Debug, PartialEq)]
@@ -149,7 +163,7 @@ cluster = "local"
 [cluster.local]
 endpoint = "127.0.0.1:9003"
 "#;
-        let mut profile: Config = toml::de::from_str(toml).unwrap();
+        let mut profile = Config::load_str(toml).unwrap();
         let config = profile.cluster_mut("local").unwrap();
 
         #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -182,7 +196,7 @@ endpoint = "127.0.0.1:9003"
 [cluster.local.metadata.installation]
 type = "local"
 "#;
-        let mut profile: Config = toml::de::from_str(toml).unwrap();
+        let mut profile = Config::load_str(toml).unwrap();
         let config = profile.cluster_mut("local").unwrap();
 
         #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -202,7 +216,7 @@ type = "local"
             }
         );
 
-        install.typ = "cloud".to_owned();
+        "cloud".clone_into(&mut install.typ);
 
         config
             .update_metadata_by_name("installation", install)
@@ -227,7 +241,7 @@ endpoint = "127.0.0.1:9003"
 [cluster.local.metadata.installation]
 type = "local"
 "#;
-        let mut profile: Config = toml::de::from_str(toml).unwrap();
+        let mut profile = Config::load_str(toml).unwrap();
         let config = profile.cluster_mut("local").unwrap();
 
         #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]

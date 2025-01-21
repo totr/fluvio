@@ -8,8 +8,8 @@ $ cargo install cargo-generate
 $ cargo generate --git https://github.com/infinyon/fluvio-smartmodule-template
 ```
 
-> **Note**: To compile a SmartModule, you will need to install the `wasm32-unknown-unknown`
-> target by running `rustup target add wasm32-unknown-unknown`.
+> **Note**: To compile a SmartModule, you will need to install the `wasm32-wasip1`
+> target by running `rustup target add wasm32-wasip1`, or `rustup target add wasm32-unknown-unknown` if using the --nowasi flags
 
 ## About SmartModules
 
@@ -45,10 +45,10 @@ This filter will keep only records whose data contains the letter `z`.
 Make sure to follow the [Fluvio getting started] guide, then create a new
 topic to send data to.
 
-[Fluvio getting started]: https://www.fluvio.io/docs/getting-started/
+[Fluvio getting started]: https://www.fluvio.io/docs/fluvio/quickstart
 
 ```bash
 $ fluvio topic create smartmodule-test
 $ cargo build --release
-$ fluvio consume smartmodule-test -B --{{smartmodule-type}}="target/wasm32-unknown-unknown/release/{{project-name}}"
+$ fluvio consume smartmodule-test -B --{{smartmodule-type}}="target/wasm32-wasip1/release-lto/{{project-name}}"
 ```

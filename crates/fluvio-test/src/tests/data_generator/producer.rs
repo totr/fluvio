@@ -2,7 +2,7 @@ use fluvio_test_util::test_runner::test_driver::TestDriver;
 use fluvio_test_util::test_meta::environment::EnvDetail;
 use std::time::SystemTime;
 use tracing::debug;
-use fluvio::{Offset, TopicProducer, TopicProducerConfigBuilder, RecordKey};
+use fluvio::{TopicProducerPool, Offset, RecordKey, TopicProducerConfigBuilder};
 use futures::StreamExt;
 use std::time::Duration;
 
@@ -96,12 +96,9 @@ pub async fn producer(
     // Create the syncing producer/consumer
 
     let sync_producer = test_driver.create_producer(&sync_topic).await;
-    let sync_consumer = test_driver.get_consumer(&sync_topic, 0).await;
-
-    let mut sync_stream = sync_consumer
-        .stream(Offset::from_end(0))
-        .await
-        .expect("Unable to open stream");
+    let mut sync_stream = test_driver
+        .get_consumer_with_start(&sync_topic, 0, Offset::from_end(0))
+        .await;
 
     // Let syncing process know this producer is ready
     sync_producer.send(RecordKey::NULL, "ready").await.unwrap();
@@ -145,7 +142,7 @@ async fn send_record(
     producer_id: u32,
     records_sent: u32,
     test_driver: &TestDriver,
-    producer: &TopicProducer,
+    producer: &TopicProducerPool,
 ) {
     let record = generate_record(option.clone(), producer_id, records_sent);
     test_driver

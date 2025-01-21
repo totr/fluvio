@@ -8,6 +8,8 @@ use url::Url;
 use fluvio_hub_util::HUB_REMOTE;
 use fluvio_hub_util::fvm::{Client, Channel, PackageSet};
 
+use crate::common::version_directory::VersionDirectory;
+use crate::common::workdir::fvm_versions_path;
 use crate::common::TARGET;
 use crate::common::notify::Notify;
 use crate::common::settings::Settings;
@@ -16,7 +18,7 @@ use crate::common::version_installer::VersionInstaller;
 #[derive(Debug, Args)]
 pub struct UpdateOpt {
     /// Registry used to fetch Fluvio Versions
-    #[arg(long, env = "HUB_REGISTRY_URL", default_value = HUB_REMOTE)]
+    #[arg(long, env = "INFINYON_HUB_REMOTE", default_value = HUB_REMOTE)]
     registry: Url,
 }
 
@@ -42,10 +44,12 @@ impl UpdateOpt {
             );
             return Ok(());
         };
+        let ch_version = Channel::parse(&version)?; // convert to comparable Channel
+        let ps_version = Channel::parse(latest_pkgset.pkgset.to_string())?;
 
         match channel {
             Channel::Stable => {
-                if latest_pkgset.pkgset > version {
+                if ps_version > ch_version {
                     notify.info(format!(
                         "Updating fluvio {} to version {}. Current version is {}.",
                         channel.to_string().bold(),
@@ -56,6 +60,25 @@ impl UpdateOpt {
                     return VersionInstaller::new(channel, latest_pkgset, notify)
                         .install()
                         .await;
+                }
+
+                if ps_version == ch_version {
+                    // Check for patches
+                    let curr_version_path = fvm_versions_path()?.join(channel.to_string());
+                    let curr_version_dir = VersionDirectory::open(curr_version_path)?;
+                    let curr_version_pkgset = curr_version_dir.as_package_set()?;
+                    let upstream_artifacts = curr_version_pkgset.artifacts_diff(&latest_pkgset);
+
+                    if !upstream_artifacts.is_empty() {
+                        notify.info(format!(
+                            "Found {} packages in this version that needs update.",
+                            upstream_artifacts.len(),
+                        ));
+
+                        return VersionInstaller::new(channel, latest_pkgset, notify)
+                            .update(&upstream_artifacts)
+                            .await;
+                    }
                 }
 
                 notify.done("You are already up to date");
@@ -64,7 +87,7 @@ impl UpdateOpt {
                 // The latest tag can be very dynamic, so we just check for this
                 // tag to be different than the current version assuming
                 // upstream is always up to date
-                if latest_pkgset.pkgset != version {
+                if ps_version != ch_version {
                     notify.info(format!(
                         "Updating fluvio {} to version {}. Current version is {}.",
                         channel.to_string().bold(),
@@ -79,7 +102,7 @@ impl UpdateOpt {
 
                 notify.done("You are already up to date");
             }
-            Channel::Tag(_) => {
+            Channel::Tag(_) | Channel::Other(_) => {
                 notify.warn("Static tags cannot be updated. No changes made.");
             }
         }

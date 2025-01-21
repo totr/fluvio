@@ -38,7 +38,7 @@ jobs:
       runs: ${{ steps.runs.outputs.runs }}
     steps:
       - id: check
-        run: echo "::set-output name=check::${{ env.ENABLE_CHECK }}"
+        run: echo "check=${{ env.ENABLE_CHECK }}" >> "$GITHUB_OUTPUT"
 
   # Run all checks and unit test. This always run on debug mode
   build_primary_binaries:
@@ -50,7 +50,7 @@ jobs:
           - x86_64-apple-darwin
         rust: [stable]
         binary: [fluvio, fluvio-run, fluvio-test]
-        os: [macos-12]
+        os: [macos-latest]
         include:
           - os: ubuntu-latest
             rust: stable
@@ -87,12 +87,10 @@ jobs:
       - name: Print env
         run: |
           echo "RUST_BIN_DIR = ${{ env.RUST_BIN_DIR }} "
-      - name: Install Rust ${{ matrix.rust }}
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust ${{ matrix.rust }} toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
       - name: Install zig
         run: ./actions/zig-install.sh ${{ matrix.os }}
       - uses: Swatinem/rust-cache@v2
@@ -117,7 +115,7 @@ jobs:
 
       # Upload artifacts
       - name: Upload artifact - ${{ matrix.binary }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary }}-${{ matrix.rust-target }}
           path: ${{ env.RUST_BIN_DIR }}/${{ matrix.binary }}
@@ -135,7 +133,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-12]
+        os: [macos-latest]
         rust-target: [x86_64-apple-darwin]
         run: [r1]
         spu: [1]
@@ -144,18 +142,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Download artifact - fluvio
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-${{ matrix.rust-target }}
           path: ~/bin
       - name: Download artifact - fluvio-run
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-run-${{ matrix.rust-target }}
           path: ~/.fluvio/extensions
       - run: chmod +x ~/.fluvio/extensions/fluvio-run
       - name: Download artifact - fluvio-test
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-test-${{ matrix.rust-target }}
           path: ~/bin
@@ -176,7 +174,7 @@ jobs:
           kind create cluster --config k8-util/cluster/kind.yaml
       - name: Start fluvio cluster
         timeout-minutes: 5
-        run: fluvio cluster start --local --develop --spu ${{ matrix.spu }} --rust-log fluvio=debug 
+        run: fluvio cluster start --local --develop --spu ${{ matrix.spu }} --rust-log fluvio=debug
       - name: Run smoke-test
         timeout-minutes: 5
         run: |
@@ -187,7 +185,7 @@ jobs:
         timeout-minutes: 5
         run: fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: ${{ !success() }}
         with:
@@ -207,25 +205,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-12]
+        os: [macos-latest]
         rust-target: [x86_64-apple-darwin]
         run: [r1]
         spu: [1]
     steps:
       - uses: actions/checkout@v4
       - name: Download artifact - fluvio
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-${{ matrix.rust-target }}
           path: ~/bin
       - name: Download artifact - fluvio-run
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-run-${{ matrix.rust-target }}
           path: ~/.fluvio/extensions
       - run: chmod +x ~/.fluvio/extensions/fluvio-run
       - name: Download artifact - fluvio-test
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-test-${{ matrix.rust-target }}
           path: ~/bin
@@ -272,7 +270,7 @@ jobs:
 
       # Download artifacts
       - name: Download fluvio-run
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-run-${{ matrix.rust-target }}
           path: .
@@ -286,7 +284,7 @@ jobs:
       - name: Export Docker Image to tarball
         run: docker image save infinyon/fluvio:${{ github.sha }} --output /tmp/infinyon-fluvio-${{ matrix.rust-target }}.tar
       - name: Upload tarball as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: infinyon-fluvio-${{ matrix.rust-target }}.tar
           path: /tmp/infinyon-fluvio-${{ matrix.rust-target }}.tar
@@ -304,7 +302,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-12]
+        os: [macos-latest]
         rust-target: [x86_64-apple-darwin]
         k8-target: [x86_64-unknown-linux-musl]
         run: [r1]
@@ -314,17 +312,17 @@ jobs:
       - uses: actions/checkout@v4
       # Download artifacts
       - name: Download artifact - fluvio
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-${{ matrix.rust-target }}
           path: ~/bin
       - name: Download artifact - fluvio-test
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-test-${{ matrix.rust-target }}
           path: ~/bin
       - name: Download Docker Image as Artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: infinyon-fluvio-${{ matrix.k8-target }}.tar
           path: /tmp
@@ -376,7 +374,7 @@ jobs:
       - name: Upload diagnostics
         timeout-minutes: 5
         if: ${{ !success() }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: k8_${{ matrix.run }}-${{ matrix.test }}-log
           path: diagnostics*.gz

@@ -6,6 +6,7 @@ mod load;
 mod publish;
 mod hub;
 mod set_public;
+mod clean;
 
 use std::path::PathBuf;
 
@@ -14,6 +15,8 @@ use anyhow::Result;
 use tracing::debug;
 
 use cmd::SmdkCommand;
+
+pub const ENV_SMDK_NOWASI: &str = "SMDK_NOWASI";
 
 fn main() -> Result<()> {
     fluvio_future::subscriber::init_tracer(None);

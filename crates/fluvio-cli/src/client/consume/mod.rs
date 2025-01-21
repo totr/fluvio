@@ -9,17 +9,21 @@ mod table_format;
 mod record_format;
 
 use table_format::TableModel;
+
 pub use cmd::ConsumeOpt;
 
 mod cmd {
 
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{UNIX_EPOCH, Duration};
     use std::{io::Error as IoError, path::PathBuf};
-    use std::io::{self, ErrorKind, Stdout};
+    use std::io::{self, ErrorKind, IsTerminal, Stdout};
     use std::collections::BTreeMap;
     use std::fmt::Debug;
     use std::sync::Arc;
 
+    use fluvio_protocol::link::ErrorCode;
+    use futures_util::{Stream, StreamExt};
     use tracing::{debug, trace, instrument};
     use clap::{Parser, ValueEnum};
     use futures::{select, FutureExt};
@@ -39,9 +43,10 @@ mod cmd {
     use fluvio_spu_schema::server::smartmodule::SmartModuleContextData;
     use fluvio_protocol::record::NO_TIMESTAMP;
     use fluvio::metadata::tableformat::TableFormatSpec;
-    use fluvio_future::io::StreamExt;
-    use fluvio::{ConsumerConfig, Fluvio, MultiplePartitionConsumer, Offset, FluvioError};
-    use fluvio::consumer::{PartitionSelectionStrategy, Record};
+    use fluvio::{Fluvio, Offset, FluvioError};
+    use fluvio::consumer::{ConsumerConfigExt, ConsumerStream, OffsetManagementStrategy};
+
+    use fluvio::consumer::Record;
     use fluvio_spu_schema::Isolation;
 
     use crate::monitoring::init_monitoring;
@@ -63,6 +68,7 @@ mod cmd {
     use fluvio_smartengine::transformation::TransformationConfig;
 
     const USER_TEMPLATE: &str = "user_template";
+    const DEFAULT_OFFSET_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
     /// Read messages from a topic/partition
     ///
@@ -78,6 +84,10 @@ mod cmd {
         /// Partition id
         #[arg(short = 'p', long, value_name = "integer")]
         pub partition: Vec<PartitionId>,
+
+        /// Remote cluster to consume from
+        #[arg(short = 'm', long)]
+        pub mirror: Option<String>,
 
         /// Consume records from all partitions
         #[arg(short = 'A', long = "all-partitions", conflicts_with_all = &["partition"])]
@@ -197,17 +207,26 @@ mod cmd {
         pub params: Option<Vec<(String, String)>>,
 
         /// (Optional) Path to a file with transformation specification.
-        #[arg(long, conflicts_with = "smartmodule_group")]
-        pub transforms_file: Option<PathBuf>,
+        #[arg(
+            short,
+            long,
+            conflicts_with = "smartmodule_group",
+            alias = "transforms-file"
+        )]
+        pub transforms: Option<PathBuf>,
 
         /// (Optional) Transformation specification as JSON formatted string.
-        /// E.g. fluvio consume topic-name --transform='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
-        #[arg(long, short, conflicts_with_all = &["smartmodule_group", "transforms_file"])]
-        pub transform: Vec<String>,
+        /// E.g. fluvio consume topic-name --transforms-line='{"uses":"infinyon/jolt@0.1.0","with":{"spec":"[{\"operation\":\"default\",\"spec\":{\"source\":\"test\"}}]"}}'
+        #[arg(long, conflicts_with_all = &["smartmodule_group", "transforms"], alias = "transform")]
+        pub transforms_line: Vec<String>,
 
         /// Truncate the output to one line
         #[arg(long, conflicts_with_all = &["output", "format"])]
         pub truncate: bool,
+
+        /// Consumer id
+        #[arg(short, long)]
+        pub consumer: Option<String>,
     }
 
     #[async_trait]
@@ -255,22 +274,7 @@ mod cmd {
                 None
             };
 
-            if self.all_partitions || self.partition.is_empty() {
-                let consumer = fluvio
-                    .consumer(PartitionSelectionStrategy::All(self.topic.clone()))
-                    .await?;
-                self.consume_records(consumer, maybe_tableformat).await?;
-            } else {
-                let consumer = fluvio
-                    .consumer(PartitionSelectionStrategy::Multiple(
-                        self.partition
-                            .iter()
-                            .map(|p| (self.topic.clone(), *p))
-                            .collect(),
-                    ))
-                    .await?;
-                self.consume_records(consumer, maybe_tableformat).await?;
-            };
+            self.consume_records(fluvio, maybe_tableformat).await?;
 
             Ok(())
         }
@@ -298,14 +302,29 @@ mod cmd {
 
         pub async fn consume_records(
             &self,
-            consumer: MultiplePartitionConsumer,
+            fluvio: &Fluvio,
             tableformat: Option<TableFormatSpec>,
         ) -> Result<()> {
             trace!(config = ?self, "Starting consumer:");
-            self.init_ctrlc()?;
+            let stop_signal = self.init_ctrlc()?;
             let offset = self.calculate_offset()?;
 
-            let mut builder = ConsumerConfig::builder();
+            let mut builder = ConsumerConfigExt::builder();
+            builder.topic(&self.topic);
+            builder.offset_start(offset);
+            for partition in &self.partition {
+                builder.partition(*partition);
+            }
+            if let Some(ref consumer) = self.consumer {
+                builder.offset_consumer(consumer.clone());
+                builder.offset_strategy(OffsetManagementStrategy::Auto);
+                builder.offset_flush(DEFAULT_OFFSET_FLUSH_INTERVAL);
+            }
+
+            if let Some(ref mirror) = self.mirror {
+                builder.mirror(mirror.clone());
+            }
+
             if let Some(max_bytes) = self.max_bytes {
                 builder.max_bytes(max_bytes);
             }
@@ -327,17 +346,16 @@ mod cmd {
                     self.smart_module_ctx(),
                     initial_param,
                 )?]
-            } else if !self.transform.is_empty() {
-                let config =
-                    TransformationConfig::try_from(self.transform.clone()).map_err(|err| {
+            } else if !self.transforms_line.is_empty() {
+                let config = TransformationConfig::try_from(self.transforms_line.clone()).map_err(
+                    |err| {
                         CliError::InvalidArg(format!("unable to parse `transform` argument: {err}"))
-                    })?;
+                    },
+                )?;
                 create_smartmodule_list(config)?
-            } else if let Some(transforms_file) = &self.transforms_file {
-                let config = TransformationConfig::from_file(transforms_file).map_err(|err| {
-                    CliError::InvalidArg(format!(
-                        "unable to process `transforms_file` argument: {err}"
-                    ))
+            } else if let Some(transforms) = &self.transforms {
+                let config = TransformationConfig::from_file(transforms).map_err(|err| {
+                    CliError::InvalidArg(format!("unable to process `transforms` argument: {err}"))
                 })?;
                 create_smartmodule_list(config)?
             } else {
@@ -372,11 +390,21 @@ mod cmd {
             let consume_config = builder.build()?;
             debug!("consume config: {:#?}", consume_config);
 
-            self.consume_records_stream(consumer, offset, consume_config, tableformat)
+            self.print_status();
+            let mut stream = fluvio
+                .consumer_with_config(consume_config)
+                .await?
+                .take_until(stop_signal.recv());
+            self.consume_records_stream(&mut stream, tableformat)
                 .await?;
 
             if !self.disable_continuous {
                 eprintln!("Consumer stream has closed");
+            }
+
+            if self.consumer.is_some() {
+                stream.get_mut().offset_commit()?;
+                stream.get_mut().offset_flush().await?;
             }
 
             Ok(())
@@ -385,14 +413,10 @@ mod cmd {
         /// Consume records as a stream, waiting for new records to arrive
         async fn consume_records_stream(
             &self,
-            consumer: MultiplePartitionConsumer,
-            offset: Offset,
-            config: ConsumerConfig,
+            stream: &mut (impl Stream<Item = Result<Record, ErrorCode>> + Unpin),
             tableformat: Option<TableFormatSpec>,
         ) -> Result<()> {
-            self.print_status();
             let maybe_potential_end_offset: Option<u32> = self.end;
-            let mut stream = consumer.stream_with_config(offset, config).await?;
 
             let templates = match self.format.as_deref() {
                 None => None,
@@ -685,7 +709,8 @@ mod cmd {
 
         fn print_status(&self) {
             use colored::*;
-            if !atty::is(atty::Stream::Stdout) {
+
+            if !std::io::stdout().is_terminal() {
                 return;
             }
 
@@ -693,10 +718,19 @@ mod cmd {
         }
 
         /// Initialize Ctrl-C event handler
-        fn init_ctrlc(&self) -> Result<()> {
+        fn init_ctrlc(&self) -> Result<async_channel::Receiver<()>> {
+            let (s, r) = async_channel::bounded(1);
+            let invoked = AtomicBool::new(false);
             let result = ctrlc::set_handler(move || {
                 debug!("detected control c, setting end");
-                std::process::exit(0);
+                if invoked.load(Ordering::SeqCst) {
+                    std::process::exit(0);
+                } else {
+                    invoked.store(true, Ordering::SeqCst);
+                    let _ = s.try_send(());
+                    std::thread::sleep(Duration::from_secs(2));
+                    std::process::exit(0);
+                }
             });
 
             if let Err(err) = result {
@@ -706,7 +740,7 @@ mod cmd {
                 )
                 .into());
             }
-            Ok(())
+            Ok(r)
         }
 
         /// Calculate the Offset to use with the consumer based on the provided offset number
@@ -756,6 +790,7 @@ mod cmd {
             ConsumeOpt {
                 topic: "TOPIC_NAME".to_string(),
                 partition: Default::default(),
+                mirror: Default::default(),
                 all_partitions: Default::default(),
                 disable_continuous: Default::default(),
                 disable_progressbar: Default::default(),
@@ -775,9 +810,10 @@ mod cmd {
                 params: Default::default(),
                 isolation: Default::default(),
                 beginning: Default::default(),
-                transforms_file: Default::default(),
-                transform: Default::default(),
+                transforms: Default::default(),
+                transforms_line: Default::default(),
                 truncate: Default::default(),
+                consumer: Default::default(),
             }
         }
         #[test]

@@ -10,11 +10,14 @@ use crate::HUB_API_CONN_LIST;
 
 use super::get_pkg_list;
 
-/// List all available SmartConnectors
+/// List all available Connectors
 #[derive(Debug, Parser)]
 pub struct ConnectorHubListOpts {
     #[clap(flatten)]
     output: OutputFormat,
+
+    #[arg(long, hide = true)]
+    system: bool,
 
     #[arg(long, hide_short_help = true)]
     remote: Option<String>,
@@ -22,7 +25,7 @@ pub struct ConnectorHubListOpts {
 
 impl ConnectorHubListOpts {
     pub async fn process<O: Terminal + Debug + Send + Sync>(self, out: Arc<O>) -> Result<()> {
-        let pl = get_pkg_list(HUB_API_CONN_LIST, &self.remote).await?;
+        let pl = get_pkg_list(HUB_API_CONN_LIST, &self.remote, self.system).await?;
         output::tableformat(out, pl.packages, self.output.format)?;
         Ok(())
     }
@@ -39,10 +42,12 @@ mod output {
     use anyhow::Result;
 
     use fluvio_extension_common::output::OutputType;
+    use fluvio_extension_common::time::time_elapsed;
     use fluvio_extension_common::Terminal;
     use fluvio_extension_common::output::TableOutputHandler;
     use fluvio_extension_common::t_println;
-    use crate::PackageMeta;
+
+    use crate::{PackageMeta, PackageMetaExt};
 
     #[derive(Serialize)]
     struct ListConnectors(Vec<PackageMeta>);
@@ -75,7 +80,7 @@ mod output {
     impl TableOutputHandler for ListConnectors {
         /// table header implementation
         fn header(&self) -> Row {
-            Row::from(["CONNECTOR", "Visibility"])
+            Row::from(["CONNECTOR", "Visibility", "Released"])
         }
 
         /// return errors in string format
@@ -91,6 +96,11 @@ mod output {
                     Row::from([
                         Cell::new(e.pkg_name()).set_alignment(CellAlignment::Left),
                         Cell::new(&e.visibility).set_alignment(CellAlignment::Left),
+                        Cell::new(
+                            e.published_at()
+                                .map(|date| time_elapsed(date).unwrap_or(String::from("N/A")))
+                                .unwrap_or(String::from("N/A")),
+                        ),
                     ])
                 })
                 .collect()

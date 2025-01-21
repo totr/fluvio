@@ -2,10 +2,12 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use tracing::debug;
 
-use fluvio_hub_protocol::{PackageMeta, HubError};
-use fluvio_hub_protocol::constants::HUB_PACKAGE_META;
+use fluvio_hub_protocol::{HubError, PackageMeta, PkgTag};
+use fluvio_hub_protocol::constants::{HUB_PACKAGE_META, PKG_TAG_META_PUBLISHED_AT};
+use fluvio_hub_protocol::validate_allowedchars;
 
 use crate::package_get_topfile;
 
@@ -16,6 +18,7 @@ pub trait PackageMetaExt {
     fn manifest_paths<P: AsRef<Path>>(&self, pkgpath_in: P) -> Result<Vec<String>>;
     fn write<P: AsRef<Path>>(&self, pmetapath: P) -> Result<()>;
     fn update_from_cargo_toml<P: AsRef<Path>>(&mut self, fpath: P) -> Result<()>;
+    fn published_at(&self) -> Result<DateTime<Utc>>;
 }
 
 impl PackageMetaExt for PackageMeta {
@@ -43,7 +46,7 @@ impl PackageMetaExt for PackageMeta {
         Ok(())
     }
 
-    /// Pull pacakge-meta info from Cargo.toml,
+    /// Pull package-meta info from Cargo.toml,
     /// particularly package name and version
     fn update_from_cargo_toml<P: AsRef<Path>>(&mut self, fpath: P) -> Result<()> {
         let ctoml = cargo_toml::Manifest::from_path(fpath)?;
@@ -54,6 +57,23 @@ impl PackageMetaExt for PackageMeta {
         self.version = cpkg.version.get()?.to_string();
 
         Ok(())
+    }
+
+    fn published_at(&self) -> Result<DateTime<Utc>> {
+        let published_at_pkg_tag = self
+            .tags
+            .as_ref()
+            .ok_or(HubError::General(String::from("No tags available")))?
+            .iter()
+            .find(|PkgTag { tag, .. }| tag == PKG_TAG_META_PUBLISHED_AT)
+            .ok_or(HubError::General(format!(
+                "Missing {PKG_TAG_META_PUBLISHED_AT} tag"
+            )))?;
+
+        let publisted_at = DateTime::parse_from_rfc2822(published_at_pkg_tag.value.as_str())
+            .map_err(|err| HubError::General(format!("Failed to parse publish date. {}", err)))?;
+
+        Ok(publisted_at.to_utc())
     }
 }
 
@@ -80,18 +100,6 @@ pub fn validate_notempty(val: &str, name: &str) -> String {
 pub fn validate_lowercase(val: &str, name: &str) -> String {
     if val.to_lowercase() != val {
         format!("{name} {val} should be lowercase\n")
-    } else {
-        String::new()
-    }
-}
-
-pub fn validate_allowedchars(val: &str, name: &str) -> String {
-    let good_chars = val
-        .chars()
-        .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '-' | '_'));
-
-    if !good_chars {
-        format!("{name} {val} should be alphanumeric, '-' or '_'\n")
     } else {
         String::new()
     }
@@ -155,6 +163,8 @@ pub fn package_meta_relative_path<P: AsRef<Path>, T: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
+    use fluvio_hub_protocol::PkgTag;
+
     use super::*;
 
     #[test]
@@ -468,5 +478,48 @@ mod tests {
                 assert_eq!(pm.visibility, PkgVisibility::Private);
             }
         }
+    }
+
+    #[test]
+    fn inf_meta_published_at_success() {
+        let pm = PackageMeta {
+            group: "infinyon".into(),
+            name: "example".into(),
+            version: "0.0.1".into(),
+            manifest: ["module.wasm".into()].to_vec(),
+            tags: Some(vec![PkgTag {
+                tag: PKG_TAG_META_PUBLISHED_AT.to_string(),
+                value: "Tue, 22 Nov 2022 21:24:11 GMT".to_string(),
+            }]),
+            ..Default::default()
+        };
+        let published_at = pm.published_at();
+
+        assert!(published_at.is_ok());
+
+        let published_at = published_at.unwrap();
+        assert_eq!(published_at.to_string(), "2022-11-22 21:24:11 UTC");
+    }
+
+    #[test]
+    fn inf_meta_published_at_missing_tag() {
+        let pm = PackageMeta {
+            group: "infinyon".into(),
+            name: "example".into(),
+            version: "0.0.1".into(),
+            manifest: ["module.wasm".into()].to_vec(),
+            tags: Some(vec![PkgTag {
+                tag: String::from("foo"),
+                value: String::from("bar"),
+            }]),
+            ..Default::default()
+        };
+        let published_at = pm.published_at();
+
+        assert!(published_at.is_err());
+        assert_eq!(
+            published_at.err().unwrap().to_string(),
+            format!("General Error: Missing inf::meta::published_at tag")
+        );
     }
 }

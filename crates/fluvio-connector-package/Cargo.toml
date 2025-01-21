@@ -14,8 +14,8 @@ default = ["toml"]
 anyhow = { workspace = true }
 bytesize = { workspace = true }
 humantime-serde = { workspace = true }
-minijinja = { version = "1.0.0", default-features = false, features = ["custom_syntax", "fuel"] }
-openapiv3 = { git = "https://github.com/galibey/openapiv3", rev = "bdd22f046d2bc19ede257504645d31f835545222", default-features = false }
+minijinja = { version = "1.0", default-features = false, features = ["custom_syntax", "fuel"] }
+openapiv3 = { version = "2.0", default-features = false }
 serde = { workspace = true, features = ["derive"], default-features = false }
 serde_yaml = { workspace = true }
 toml = { workspace = true , optional = true, features = ["display", "parse", "preserve_order"] }
@@ -28,7 +28,6 @@ fluvio-controlplane-metadata = { path = "../fluvio-controlplane-metadata/", defa
 fluvio-smartengine = { path = "../fluvio-smartengine", default-features = false, features = [
     "transformation",
 ] }
-fluvio-compression = { path = "../fluvio-compression" }
 fluvio-types = { path = "../fluvio-types" }
 bytesize-serde = "0.2.1"
 

@@ -41,12 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust ${{ matrix.rust }}
-        uses: actions-rs/toolchain@v1
+      - name: Install Rust ${{ matrix.rust }} Toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
-          profile: minimal
-          override: true
+
       - name: Install zig
         run: ./actions/zig-install.sh ${{ matrix.os }}
       - uses: Swatinem/rust-cache@v2
@@ -67,7 +66,7 @@ jobs:
 
       # Upload artifacts
       - name: Upload artifact - ${{ matrix.binary }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.binary }}-${{ matrix.rust-target }}
           path: ${{ env.RUST_BIN_DIR }}/${{ matrix.binary }}
@@ -119,7 +118,7 @@ jobs:
 
       - name: Download build artifact - fluvio-test
         if: ${{ false }}
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: fluvio-test-${{ matrix.rust-target }}
           path: ~/bin
@@ -152,14 +151,15 @@ jobs:
         if: ${{ matrix.cluster_type == 'k8' }}
         run: |
           ./k8-util/cluster/reset-k3d.sh
-      - name: Install Fluvio CLI and start cluster
-        run: |
-          curl -fsS https://hub.infinyon.cloud/install/install.sh | VERSION=latest bash
-          echo "$HOME/.fluvio/bin" >> $GITHUB_PATH
+      - name: Setup Fluvio
+        uses: infinyon/fluvio/.github/actions/setup-fluvio@master
+        with:
+          version: latest
       - name: Start Fluvio Cluster
+        # --image-version is only used in the k8 cluster_type
         run: |
           fluvio version
-          fluvio cluster start --${{ matrix.cluster_type}}
+          fluvio cluster start --${{ matrix.cluster_type}} --image-version latest
 
       # Disabled for now bc data load is unstable in CI
       #- name: Look for longevity data
@@ -215,7 +215,7 @@ jobs:
       #    tar -xvf longevity-data.tar
 
       ## TODO: Add a shorter cache time
-      #- uses: actions/upload-artifact@v3
+      #- uses: actions/upload-artifact@v4
       #  with:
       #    name: 'longevity-data'
       #    path: longevity-data.tar
@@ -225,7 +225,7 @@ jobs:
         timeout-minutes: 5
         run: fluvio cluster diagnostics
       - name: Upload diagnostics
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         timeout-minutes: 5
         if: failure()
         with:

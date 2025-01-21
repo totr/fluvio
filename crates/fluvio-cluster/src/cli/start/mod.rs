@@ -107,12 +107,14 @@ pub struct K8Install {
     #[arg(long)]
     pub chart_values: Vec<PathBuf>,
 
-    /// Uses port forwarding for connecting to SC during install
+    /// Uses port forwarding for connecting to SC (only during install)
+    ///
+    /// For connecting to a cluster during and after install, --proxy-addr <IP or DNS> is recommended
     #[arg(long)]
     use_k8_port_forwarding: bool,
 
-    /// Uses port forwarding for connecting to SC during install
-    #[arg(long)]
+    /// Config option used in kubernetes deployments
+    #[arg(long, hide = true)]
     use_cluster_ip: bool,
 
     /// TLS: Client secret name while adding to Kubernetes
@@ -138,6 +140,18 @@ pub struct StartOpt {
 
     #[arg(long)]
     pub skip_profile_creation: bool,
+
+    /// SC public address
+    #[arg(long)]
+    pub sc_pub_addr: Option<String>,
+
+    /// SC private address
+    #[arg(long)]
+    pub sc_priv_addr: Option<String>,
+
+    /// data dir
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
 
     /// number of SPU
     #[arg(long, default_value = "1")]
@@ -240,6 +254,7 @@ impl IntallationTypeOpt {
             InstallationType::LocalK8 => (false, true, false, None),
             InstallationType::ReadOnly => (false, false, false, Some(Default::default())),
             InstallationType::Docker => (false, false, false, None),
+            InstallationType::Cloud => (false, false, false, None),
         };
         self.local = local;
         self.local_k8 = local_k8;

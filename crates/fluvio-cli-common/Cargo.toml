@@ -13,27 +13,32 @@ name = "fluvio_cli_common"
 path = "src/lib.rs"
 
 [features]
-default = ["fluvio-types"]
+default = ["fluvio-types", "serde"]
 file-records = ["fluvio-protocol/record", "fluvio-protocol/api"]
 version-cmd = ["dep:current_platform", "dep:clap", "dep:sysinfo"]
 smartmodule-test = ["file-records", "dep:fluvio-sc-schema", "dep:fluvio-smartmodule", "dep:fluvio", "dep:fluvio-smartengine", "dep:clap"]
+serde = ["dep:serde", "dep:serde_json", "dep:serde-tuple-vec-map"]
 
 [dependencies]
 anyhow = { workspace = true }
 current_platform = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
+clap = { workspace = true, optional = true, features = ["derive", "std"] }
 bytes = { workspace = true }
 chrono = { workspace = true }
-futures = { workspace = true, features = ["std", "io-compat"]}
+comfy-table = { workspace = true }
 home = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+serde-tuple-vec-map = { workspace = true, optional = true }
 semver = { workspace = true }
 sha2 = { workspace = true }
 sysinfo = { workspace = true, optional = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+ureq = { workspace = true }
 
 fluvio = { path = "../fluvio", optional = true, default-features = false }
 fluvio-package-index = { workspace = true,  features = ["http_agent"] }
@@ -43,13 +48,3 @@ fluvio-sc-schema = { path = "../fluvio-sc-schema", optional = true }
 fluvio-smartmodule = { path = "../fluvio-smartmodule", optional = true, default-features = false }
 fluvio-smartengine = { path = "../fluvio-smartengine", optional = true, features = ["transformation"] }
 
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-isahc = { version = "1.7", default-features = false, features = ["static-curl"] }
-
-# 2023-10-05
-# on macos sonoma, the system curl library is required due to segfault in currently available non-system libcurls
-[target.'cfg(target_os = "macos")'.dependencies]
-isahc = { version = "1.7", default-features = false }
-
-[dev-dependencies]
-fluvio-future = { workspace = true, features = ["fs", "io", "subscriber", "native2_tls", "fixture"] }

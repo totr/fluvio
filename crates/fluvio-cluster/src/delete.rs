@@ -1,22 +1,18 @@
 use std::process::Command;
-use std::fs::{remove_dir_all, remove_file};
 
 use derive_builder::Builder;
 use k8_client::meta_client::MetadataClient;
 use tracing::{info, warn, debug, instrument};
-use sysinfo::{ProcessExt, System, SystemExt};
 
 use fluvio_command::CommandExt;
-use fluvio_types::defaults::SPU_MONITORING_UNIX_SOCKET;
 
 use crate::helm::HelmClient;
 use crate::charts::{APP_CHART_NAME, SYS_CHART_NAME};
 use crate::progress::ProgressBarFactory;
 use crate::render::ProgressRenderer;
-use crate::DEFAULT_NAMESPACE;
+use crate::{process, DEFAULT_NAMESPACE};
 use crate::error::UninstallError;
-use crate::ClusterError;
-use crate::start::local::DEFAULT_DATA_DIR;
+use anyhow::Result;
 
 /// Uninstalls different flavors of fluvio
 #[derive(Builder, Debug)]
@@ -50,7 +46,7 @@ impl ClusterUninstallConfig {
         ClusterUninstallConfigBuilder::default()
     }
 
-    pub fn uninstaller(self) -> Result<ClusterUninstaller, ClusterError> {
+    pub fn uninstaller(self) -> Result<ClusterUninstaller> {
         ClusterUninstaller::from_config(self)
     }
 }
@@ -66,7 +62,7 @@ pub struct ClusterUninstaller {
 }
 
 impl ClusterUninstaller {
-    fn from_config(config: ClusterUninstallConfig) -> Result<Self, ClusterError> {
+    fn from_config(config: ClusterUninstallConfig) -> Result<Self> {
         let helm_client = if config.uninstall_k8 || config.uninstall_sys {
             Some(HelmClient::new().map_err(UninstallError::HelmError)?)
         } else {
@@ -81,7 +77,7 @@ impl ClusterUninstaller {
     }
 
     #[instrument(skip(self))]
-    pub async fn uninstall(&self) -> Result<(), ClusterError> {
+    pub async fn uninstall(&self) -> Result<()> {
         if self.config.uninstall_k8 {
             self.uninstall_k8().await?;
             if let Err(err) = self.cleanup_k8().await {
@@ -100,12 +96,12 @@ impl ClusterUninstaller {
     }
 
     #[instrument(skip(self))]
-    async fn uninstall_k8(&self) -> Result<(), ClusterError> {
+    async fn uninstall_k8(&self) -> Result<()> {
         use fluvio_helm::UninstallArg;
 
         let pb = self.pb_factory.create()?;
         pb.set_message("Uninstalling fluvio kubernetes components");
-        let uninstall = UninstallArg::new(self.config.app_chart_name.to_owned())
+        let uninstall: UninstallArg = UninstallArg::new(self.config.app_chart_name.to_owned())
             .namespace(self.config.namespace.to_owned())
             .ignore_not_found();
         self.helm_client
@@ -121,7 +117,7 @@ impl ClusterUninstaller {
     }
 
     #[instrument(skip(self))]
-    async fn uninstall_sys(&self) -> Result<(), ClusterError> {
+    async fn uninstall_sys(&self) -> Result<()> {
         use fluvio_helm::UninstallArg;
 
         let pb = self.pb_factory.create()?;
@@ -143,68 +139,19 @@ impl ClusterUninstaller {
         Ok(())
     }
 
-    async fn uninstall_local(&self) -> Result<(), ClusterError> {
+    async fn uninstall_local(&self) -> Result<()> {
         let pb = self.pb_factory.create()?;
-        pb.set_message("Uninstalling fluvio local components");
-
-        let kill_proc = |name: &str, command_args: Option<&[String]>| {
-            let mut sys = System::new();
-            sys.refresh_processes(); // Only load what we need.
-            for process in sys.processes_by_exact_name(name) {
-                if let Some(cmd_args) = command_args {
-                    // First command is the executable so cut that out.
-                    let proc_cmds = &process.cmd()[1..];
-                    if cmd_args.len() > proc_cmds.len() {
-                        continue; // Ignore procs with less command_args than the target.
-                    }
-                    if cmd_args.iter().ne(proc_cmds[..cmd_args.len()].iter()) {
-                        continue; // Ignore procs which don't match.
-                    }
-                }
-                if !process.kill() {
-                    // This will fail if called on a proc running as root, so only log failure.
-                    debug!(
-                        "Sysinto process.kill() returned false. pid: {}, name: {}: user: {:?}",
-                        process.pid(),
-                        process.name(),
-                        process.user_id(),
-                    );
-                }
-            }
-        };
-        kill_proc("fluvio", Some(&["cluster".into(), "run".into()]));
-        kill_proc("fluvio", Some(&["run".into()]));
-        kill_proc("fluvio-run", None);
+        process::kill_local_processes(&pb).await?;
 
         // delete fluvio file
         debug!("Removing fluvio directory");
-        match &*DEFAULT_DATA_DIR {
-            Some(data_dir) => match remove_dir_all(data_dir) {
-                Ok(_) => {
-                    debug!("Removed data dir: {}", data_dir.display());
-                }
-                Err(err) => {
-                    warn!("fluvio dir can't be removed: {}", err);
-                }
-            },
-            None => {
-                warn!("Unable to find data dir, cannot remove");
-            }
-        }
+        process::delete_data_dir();
+
+        // delete local cluster config file
+        process::delete_local_config();
 
         // remove monitoring socket
-        match remove_file(SPU_MONITORING_UNIX_SOCKET) {
-            Ok(_) => {
-                pb.println(format!(
-                    "Removed spu monitoring socket: {SPU_MONITORING_UNIX_SOCKET}"
-                ));
-            }
-            Err(err) => {
-                pb.println(format!(
-                    "SPU monitoring socket  {SPU_MONITORING_UNIX_SOCKET}, can't be removed: {err}"
-                ));
-            }
-        }
+        process::delete_spu_socket();
 
         pb.println("Uninstalled fluvio local components");
         pb.finish_and_clear();
@@ -215,7 +162,7 @@ impl ClusterUninstaller {
     /// Clean up k8 objects and secrets created during the installation process
     ///
     /// Ignore any errors, cleanup should be idempotent
-    async fn cleanup_k8(&self) -> Result<(), ClusterError> {
+    async fn cleanup_k8(&self) -> Result<()> {
         let pb = self.pb_factory.create()?;
         pb.set_message("Cleaning up objects and secrets created during the installation process");
         let ns = &self.config.namespace;
@@ -251,7 +198,7 @@ impl ClusterUninstaller {
         selector: Option<&str>,
         force: bool,
         pb: &ProgressRenderer,
-    ) -> Result<(), UninstallError> {
+    ) -> Result<()> {
         pb.set_message(format!("Removing {object_type} objects"));
         let mut cmd = Command::new("kubectl");
         cmd.arg("delete");
@@ -278,7 +225,7 @@ impl ClusterUninstaller {
 
     /// in order to remove partitions, finalizers need to be cleared
     #[instrument(skip(self))]
-    async fn remove_finalizers_for_partitions(&self, namespace: &str) -> anyhow::Result<()> {
+    async fn remove_finalizers_for_partitions(&self, namespace: &str) -> Result<()> {
         use fluvio_controlplane_metadata::partition::PartitionSpec;
         use fluvio_controlplane_metadata::store::k8::K8ExtendedSpec;
         use k8_client::load_and_share;
@@ -319,7 +266,7 @@ impl ClusterUninstaller {
     }
 
     /// Remove K8 secret
-    fn remove_secrets(&self, name: &str) -> Result<(), UninstallError> {
+    fn remove_secrets(&self, name: &str) -> Result<()> {
         Command::new("kubectl")
             .arg("delete")
             .arg("secret")

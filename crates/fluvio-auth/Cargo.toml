@@ -14,6 +14,7 @@ name = "fluvio_auth"
 path = "src/lib.rs"
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true  }
 serde = { workspace = true, features = ['derive'] }
@@ -26,6 +27,5 @@ fluvio-controlplane-metadata = { workspace = true  }
 fluvio-future = { workspace = true, features = ["net", "openssl_tls"] }
 fluvio-protocol = { workspace = true }
 fluvio-socket = { workspace = true }
-fluvio-types = { workspace = true  }
 flv-tls-proxy = { workspace = true }
 

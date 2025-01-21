@@ -2,6 +2,8 @@ mod create;
 mod delete;
 mod describe;
 mod list;
+mod add_partition;
+mod add_mirror;
 
 pub use cmd::TopicCmd;
 
@@ -21,6 +23,8 @@ mod cmd {
     use crate::common::output::Terminal;
     use crate::common::FluvioExtensionMetadata;
 
+    use super::add_mirror::AddMirrorOpt;
+    use super::add_partition::AddPartitionOpt;
     use super::create::CreateTopicOpt;
     use super::delete::DeleteTopicOpt;
     use super::describe::DescribeTopicsOpt;
@@ -56,6 +60,20 @@ mod cmd {
             help_template = COMMAND_TEMPLATE,
         )]
         List(ListTopicsOpt),
+
+        /// Add a new Partition to a Topic
+        #[command(
+            name = "add-partition",
+            help_template = COMMAND_TEMPLATE,
+        )]
+        AddPartition(AddPartitionOpt),
+
+        /// Add a new remote to a Topic
+        #[command(
+            name = "add-mirror",
+            help_template = COMMAND_TEMPLATE,
+        )]
+        AddMirror(AddMirrorOpt),
     }
 
     #[async_trait]
@@ -77,6 +95,12 @@ mod cmd {
                 }
                 Self::List(list) => {
                     list.process(out, fluvio).await?;
+                }
+                Self::AddPartition(add_partition) => {
+                    add_partition.process(fluvio).await?;
+                }
+                Self::AddMirror(add_mirror) => {
+                    add_mirror.process(fluvio).await?;
                 }
             }
 

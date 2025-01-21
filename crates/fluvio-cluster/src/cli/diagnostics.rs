@@ -5,7 +5,7 @@ use std::io::Error as IoError;
 use clap::Parser;
 use serde::Serialize;
 use duct::cmd;
-use sysinfo::{System, SystemExt, NetworkExt, ProcessExt, DiskExt, PidExt};
+use sysinfo::{System, Networks, Disks};
 use which::which;
 use anyhow::Result;
 
@@ -17,6 +17,8 @@ use crate::cli::ClusterCliError;
 use crate::cli::start::default_log_directory;
 use crate::start::local::{DEFAULT_DATA_DIR as DEFAULT_LOCAL_DIR, DEFAULT_METADATA_SUB_DIR};
 
+const FLUVIO_PROCESS_NAME: &str = "fluvio";
+
 #[derive(Parser, Debug)]
 pub struct DiagnosticsOpt {
     #[arg(long)]
@@ -25,8 +27,9 @@ pub struct DiagnosticsOpt {
 
 impl DiagnosticsOpt {
     pub async fn process(self) -> Result<()> {
-        let installation_ty = get_installation_type()?;
-        println!("Using installation: {installation_ty:#?}");
+        let (installation_ty, config) = get_installation_type()?;
+        let profile = config.config().current_profile_name().unwrap_or("none");
+        println!("Installation type: {installation_ty:#?}\nProfile: {profile}");
         let temp_dir = tempfile::Builder::new()
             .prefix("fluvio-diagnostics")
             .tempdir()?;
@@ -35,7 +38,7 @@ impl DiagnosticsOpt {
         let spu_specs = match self.copy_fluvio_specs(temp_path).await {
             Ok(specs) => specs,
             Err(err) => {
-                eprintln!("error copying fluivo specs: {err:#?}");
+                eprintln!("error copying fluvio specs: {err:#?}");
                 vec![]
             }
         };
@@ -99,7 +102,7 @@ impl DiagnosticsOpt {
         Ok(())
     }
 
-    fn zip_files(&self, source: &Path, output: &mut std::fs::File) -> Result<(), std::io::Error> {
+    fn zip_files(&self, source: &Path, output: &mut std::fs::File) -> Result<()> {
         use flate2::write::GzEncoder;
 
         let mut gzipper = GzEncoder::new(output, flate2::Compression::default());
@@ -154,7 +157,7 @@ impl DiagnosticsOpt {
         // Filter for only Fluvio pods
         let pods = pods
             .split(' ')
-            .filter(|pod| pod.contains("fluvio"))
+            .filter(|pod| pod.contains(FLUVIO_PROCESS_NAME))
             .collect::<Vec<_>>();
 
         for &pod in &pods {
@@ -195,7 +198,7 @@ impl DiagnosticsOpt {
         // Filter for only Fluvio services
         let objects = objects
             .split(' ')
-            .filter(|obj| !filter_fluvio || obj.contains("fluvio"))
+            .filter(|obj| !filter_fluvio || obj.contains(FLUVIO_PROCESS_NAME))
             .map(|name| name.trim())
             .collect::<Vec<_>>();
 
@@ -261,11 +264,14 @@ impl DiagnosticsOpt {
             Ok(())
         };
 
+        sysinfo::set_open_files_limit(0);
         let mut sys = System::new_all();
+        let mut net = Networks::new();
 
         // First we update all information of our `System` struct.
         println!("getting system info");
         sys.refresh_all();
+        net.refresh();
 
         let info = SystemInfo::load(&sys);
         write(serde_yaml::to_string(&info).unwrap(), "sysinfo")?;
@@ -275,7 +281,7 @@ impl DiagnosticsOpt {
         //println!("{}", disk_string);
         //  write(&disk_string, "disk")?;
 
-        let networks = NetworkInfo::load(&sys);
+        let networks = NetworkInfo::load(&net);
         write(serde_yaml::to_string(&networks).unwrap(), "networks")?;
 
         let processes = ProcessInfo::load(&sys);
@@ -373,10 +379,10 @@ struct SystemInfo {
 impl SystemInfo {
     fn load(sys: &System) -> Self {
         Self {
-            name: sys.name().unwrap_or_default(),
-            kernel_version: sys.kernel_version().unwrap_or_default(),
-            os_version: sys.os_version().unwrap_or_default(),
-            host_name: sys.host_name().unwrap_or_default(),
+            name: System::name().unwrap_or_default(),
+            kernel_version: System::kernel_version().unwrap_or_default(),
+            os_version: System::os_version().unwrap_or_default(),
+            host_name: System::host_name().unwrap_or_default(),
             processors: sys.cpus().len(),
             total_memory: sys.total_memory(),
             total_swap: sys.total_swap(),
@@ -385,6 +391,7 @@ impl SystemInfo {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct DiskInfo {
     name: String,
@@ -395,10 +402,10 @@ struct DiskInfo {
 }
 
 impl DiskInfo {
-    fn _load(sys: &System) -> Vec<DiskInfo> {
+    fn _load(diskinfo: &Disks) -> Vec<DiskInfo> {
         let mut disks = Vec::new();
 
-        for disk in sys.disks() {
+        for disk in diskinfo {
             disks.push(DiskInfo {
                 name: format!("{:?}", disk.name()),
                 mount_point: format!("{:?}", disk.mount_point()),
@@ -420,10 +427,10 @@ struct NetworkInfo {
 }
 
 impl NetworkInfo {
-    fn load(sys: &System) -> Vec<NetworkInfo> {
+    fn load(net: &Networks) -> Vec<NetworkInfo> {
         let mut networks = Vec::new();
 
-        for network in sys.networks() {
+        for network in net {
             networks.push(NetworkInfo {
                 name: network.0.to_string(),
                 received: network.1.received(),
@@ -448,13 +455,17 @@ impl ProcessInfo {
         let mut processes = Vec::new();
 
         for (pid, process) in sys.processes() {
-            if process.name().contains("fluvio") {
-                processes.push(ProcessInfo {
-                    pid: pid.as_u32(),
-                    name: process.name().to_string(),
-                    disk_usage: format!("{:?}", process.disk_usage()),
-                    cmd: format!("{:?}", process.cmd()),
-                });
+            let process_name = process.name().to_str();
+
+            if let Some(process_name) = process_name {
+                if process_name.contains(FLUVIO_PROCESS_NAME) {
+                    processes.push(ProcessInfo {
+                        pid: pid.as_u32(),
+                        name: process_name.to_string(),
+                        disk_usage: format!("{:?}", process.disk_usage()),
+                        cmd: format!("{:?}", process.cmd()),
+                    });
+                }
             }
         }
 

@@ -23,6 +23,7 @@ setup_file() {
     # Create a workspace to facilitate dependency sharing between test cases SMs
     cd $TEST_DIR
     echo '[workspace]'            > Cargo.toml
+    echo 'resolver = "2"'        >> Cargo.toml
     echo                         >> Cargo.toml
     echo 'members = ['           >> Cargo.toml
     echo ']'                     >> Cargo.toml
@@ -42,6 +43,47 @@ smdk_via_stdin() {
 }
 
 ### Using crates.io dependency for `fluvio-smartmodule`
+# bats test_tags=tag:clean
+@test "Clean" {
+    LABEL=clean
+    SMDK_SM_TYPE=filter
+    PARAMS_FLAG=--no-params
+    SM_CRATE_PATH_FLAG=
+    SM_PACKAGE_NAME=$LABEL-$SMDK_SM_TYPE-$PROJECT_NAME_PREFIX
+    SMDK_SM_PUBLIC=false
+
+    cd $TEST_DIR
+    sed -i -e $'/members/a\\\n    "'$SM_PACKAGE_NAME'",' Cargo.toml
+
+    # Generate
+    run $SMDK_BIN generate \
+        $PARAMS_FLAG \
+        $SMDK_TEMPLATE_PATH_FLAG \
+        $SM_CRATE_PATH_FLAG \
+        $TESTING_GROUP_NAME_FLAG \
+        --sm-type $SMDK_SM_TYPE \
+        --sm-public $SMDK_SM_PUBLIC \
+        --silent \
+        $SM_PACKAGE_NAME
+    assert_success
+
+
+    # Build
+    cd $SM_PACKAGE_NAME
+    run $SMDK_BIN build
+    refute_output --partial "could not compile"
+
+
+    # Verify if target exists in the parent folder
+    [ -d "../target" ]
+
+    # Clean
+    run $SMDK_BIN clean
+    assert_success
+
+    # Verify if target was removed from the parent folder
+    [ ! -d "../target" ]
+}
 
 @test "Package" {
     LABEL=package
@@ -75,10 +117,53 @@ smdk_via_stdin() {
     # Package without existing package-meta
     run $SMDK_BIN publish --pack
     assert_success
-    
+
     # Package with package-meta created before
     run $SMDK_BIN publish --pack
     assert_success
+}
+
+@test "Package with README" {
+    LABEL=package
+    SMDK_SM_TYPE=filter
+    PARAMS_FLAG=--no-params
+    SM_CRATE_PATH_FLAG=
+    SM_PACKAGE_NAME="$LABEL-$SMDK_SM_TYPE-$PROJECT_NAME_PREFIX-readme-tests"
+    SMDK_SM_PUBLIC=false
+
+    # Add SM to workspace
+    cd $TEST_DIR
+    sed -i -e $'/members/a\\\n    "'$SM_PACKAGE_NAME'",' Cargo.toml
+
+    # Generate
+    run $SMDK_BIN generate \
+        $PARAMS_FLAG \
+        $SM_CRATE_PATH_FLAG \
+        $TESTING_GROUP_NAME_FLAG \
+        --sm-type $SMDK_SM_TYPE \
+        --sm-public $SMDK_SM_PUBLIC \
+        --silent \
+        $SM_PACKAGE_NAME
+    assert_success
+
+    # Build
+    cd $SM_PACKAGE_NAME
+    run $SMDK_BIN build
+    refute_output --partial "could not compile"
+
+    # Remove README from Template on Purpose
+    rm "$TEST_DIR/$SM_PACKAGE_NAME/README.md"
+
+    # Validates SmartModule Exists
+    run $SMDK_BIN publish --pack
+    assert_output --partial 'Error: README file not found at "./README.md"'
+    assert_failure
+
+    # Packages with specified README
+    echo "# My SmartModule" > "$TEST_DIR/$SM_PACKAGE_NAME/README.md"
+    run $SMDK_BIN publish --pack
+    assert_success
+
 }
 
 @test "Generate and test filter - (stable fluvio-smartmodule / no params)" {
@@ -117,7 +202,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text 'a'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_success
 }
 
@@ -149,7 +234,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -157,7 +242,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text '2'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "4"
     assert_success
 }
@@ -190,22 +275,22 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
-    assert_success    
+    assert_success
 
     # Test with verbose
     run $SMDK_BIN test --verbose --text '["foo", "bar"]'
-    assert_output --partial "2 records outputed"
+    assert_output --partial "2 records outputted"
     assert_output --partial "foo"
     assert_output --partial "bar"
     assert_success
 
      # Test without verbose
     run $SMDK_BIN test  --text '["foo", "bar"]'
-    refute_output --partial "2 records outputed"   
+    refute_output --partial "2 records outputted"
     assert_output --partial "foo"
     assert_output --partial "bar"
     assert_success
@@ -240,7 +325,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -248,7 +333,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text '2'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "1"
     assert_success
 }
@@ -281,7 +366,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -289,7 +374,7 @@ smdk_via_stdin() {
 
     # Test
     run smdk_via_stdin '2' --verbose
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "2"
     assert_success
 }
@@ -324,7 +409,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -332,7 +417,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text 'a' -e key=value
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_success
 }
 
@@ -364,7 +449,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -399,7 +484,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -434,7 +519,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -506,7 +591,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -514,7 +599,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text 'a'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_success
 }
 
@@ -546,7 +631,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -554,7 +639,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test  --verbose  --text '2'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "4"
     assert_success
 }
@@ -587,7 +672,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -595,14 +680,14 @@ smdk_via_stdin() {
 
     # Test with verbose
     run smdk_via_stdin '["foo", "bar"]' --verbose
-    assert_output --partial "2 records outputed"
+    assert_output --partial "2 records outputted"
     assert_output --partial "foo"
     assert_output --partial "bar"
     assert_success
 
     # Test with without verbose
     run smdk_via_stdin '["foo", "bar"]'
-    refute_output --partial "2 records outputed"   
+    refute_output --partial "2 records outputted"
     assert_output --partial "foo"
     assert_output --partial "bar"
     assert_success
@@ -636,7 +721,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -644,7 +729,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text '2'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "1"
     assert_success
 }
@@ -677,7 +762,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -685,7 +770,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text '2'
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_output --partial "2"
     assert_success
 }
@@ -720,7 +805,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -728,7 +813,7 @@ smdk_via_stdin() {
 
     # Test
     run smdk_via_stdin 'a' -e key=value --verbose
-    assert_output --partial "1 records outputed"
+    assert_output --partial "1 records outputted"
     assert_success
 }
 
@@ -760,7 +845,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -795,7 +880,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -830,7 +915,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -865,7 +950,7 @@ smdk_via_stdin() {
     cd $SM_PACKAGE_NAME
     run $SMDK_BIN build
     refute_output --partial "could not compile"
-    
+
     # Load
     run $SMDK_BIN load
     assert_output --partial "Creating SmartModule: $SM_PACKAGE_NAME"
@@ -979,7 +1064,7 @@ smdk_via_stdin() {
 
     # Test
     run $SMDK_BIN test --verbose --text '["Apple", "Banana", "Cranberry"]'
-    assert_output --partial "3 records outputed"
+    assert_output --partial "3 records outputted"
     assert_output --partial "\"Apple\"_$DATE_NOW_YEAR-$DATE_NOW_MONTH-$DATE_NOW_DAY"
     assert_output --partial "\"Banana\"_$DATE_NOW_YEAR-$DATE_NOW_MONTH-$DATE_NOW_DAY"
     assert_output --partial "\"Cranberry\"_$DATE_NOW_YEAR-$DATE_NOW_MONTH-$DATE_NOW_DAY"

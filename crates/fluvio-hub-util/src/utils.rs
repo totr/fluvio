@@ -2,18 +2,19 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::io::copy;
 
+use http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use surf::http::mime;
-use surf::StatusCode;
 use tracing::{debug, info};
 
 use fluvio_hub_protocol::{PackageMeta, Result, HubError};
 use fluvio_hub_protocol::constants::HUB_PACKAGE_EXT;
 
+use crate::htclient;
 use crate::HubAccess;
 use crate::{HUB_API_SM, HUB_API_CONN_PKG};
 use crate::{package_get_meta, packagename_validate};
+use crate::htclient::ResponseExt;
 
 /// Used by hub server web api and cli exchange package lists
 #[derive(Serialize, Deserialize)]
@@ -83,22 +84,29 @@ pub fn cli_pkgname_to_filename(pkgname: &str) -> Result<String> {
 /// used by the cluster and the hub cli local download
 /// returns recommended name and data
 pub async fn get_package(pkgurl: &str, access: &HubAccess) -> Result<Vec<u8>> {
-    let actiontoken = access.get_download_token().await?;
+    let actiontoken = access.get_download_token().await.map_err(|err| {
+        tracing::debug!(?err, "action error");
+        err
+    })?;
+    tracing::trace!(tok = actiontoken, "have token");
     get_package_with_token(pkgurl, &actiontoken).await
 }
 
 pub async fn get_package_with_token(pkgurl: &str, actiontoken: &str) -> Result<Vec<u8>> {
-    let mut resp = surf::get(pkgurl)
+    let req = http::Request::get(pkgurl)
         .header("Authorization", actiontoken)
+        .body("")
+        .map_err(|_| HubError::PackageDownload("request create error".into()))?;
+
+    let resp = htclient::send(req)
         .await
-        .map_err(|_| HubError::PackageDownload("authorization error".into()))?;
+        .map_err(|e| HubError::HubAccess(format!("Failed to connect {e}")))?;
 
     match resp.status() {
-        StatusCode::Ok => {}
+        StatusCode::OK => {}
         code => {
             let body_err_message = resp
                 .body_string()
-                .await
                 .unwrap_or_else(|_err| "couldn't fetch error message".to_string());
             let msg = format!("Status({code}) {body_err_message}");
             return Err(HubError::PackageDownload(msg));
@@ -108,29 +116,25 @@ pub async fn get_package_with_token(pkgurl: &str, actiontoken: &str) -> Result<V
     // todo: validate package signing by owner
     // todo: validate package signing by hub
 
-    let data = resp
-        .body_bytes()
-        .await
-        .map_err(|_| HubError::PackageDownload("Data unpack failure".into()))?;
+    let data = resp.body().to_owned();
     Ok(data)
 }
 
 // deprecated, but keep for reference for a bit
 pub async fn get_package_noauth(pkgurl: &str) -> Result<Vec<u8>> {
-    //todo use auth
-    let mut resp = surf::get(pkgurl)
+    let resp = htclient::get(pkgurl)
         .await
         .map_err(|_| HubError::PackageDownload("".into()))?;
-    match resp.status() {
-        StatusCode::Ok => {}
+
+    let status = http::StatusCode::from_u16(resp.status().as_u16())
+        .map_err(|e| HubError::General(format!("status mapping error {e}")))?;
+    match status {
+        StatusCode::OK => {}
         _ => {
             return Err(HubError::PackageDownload("".into()));
         }
     }
-    let data = resp
-        .body_bytes()
-        .await
-        .map_err(|_| HubError::PackageDownload("Data unpack failure".into()))?;
+    let data = resp.body().to_vec();
     Ok(data)
 }
 
@@ -164,10 +168,39 @@ pub async fn push_package_conn(pkgpath: &str, access: &HubAccess, target: &str) 
         "{host}/{HUB_API_CONN_PKG}/{target}/{}/{}/{}",
         pm.group, pm.name, pm.version
     );
+    debug!(url, "package url");
     push_package_api(&url, pkgpath, access).await
 }
 
-async fn push_package_api(put_url: &str, pkgpath: &str, access: &HubAccess) -> Result<()> {
+/// push package to connector api
+pub async fn push_package_sdf(pkgpath: &str, access: &HubAccess) -> Result<()> {
+    use crate::{
+        SDF_PKG_KIND, SDF_PKG_KIND_DATAFLOW, SDF_PKG_KIND_PACKAGE, HUB_API_SDF_DATAFLOW_PUB,
+        HUB_API_SDF_PKG_PUB,
+    };
+
+    info!("sdf package push form: {pkgpath}");
+    let pm = package_get_meta(pkgpath)?;
+    let Some(sdf_kind) = pm.tag_get(SDF_PKG_KIND) else {
+        let msg = format!("Invalid sdf hub package_meta: missing tag for {SDF_PKG_KIND}");
+        return Err(HubError::PackagePublish(msg));
+    };
+    let sdf_kind = sdf_kind.first().cloned().unwrap_or_default().value;
+    let endpoint = match sdf_kind.as_str() {
+        SDF_PKG_KIND_DATAFLOW => HUB_API_SDF_DATAFLOW_PUB,
+        SDF_PKG_KIND_PACKAGE => HUB_API_SDF_PKG_PUB,
+        _ => {
+            let msg = format!("Invalid sdf hub package_meta {SDF_PKG_KIND}: {sdf_kind}");
+            return Err(HubError::PackagePublish(msg));
+        }
+    };
+    let host = &access.remote;
+    let url = format!("{host}/{endpoint}/{}/{}/{}", pm.group, pm.name, pm.version);
+    debug!(url, "package url");
+    push_package_api(&url, pkgpath, access).await
+}
+
+pub async fn push_package_api(put_url: &str, pkgpath: &str, access: &HubAccess) -> Result<()> {
     let pm = package_get_meta(pkgpath)?;
     packagename_validate(&pm.name)?;
 
@@ -179,38 +212,43 @@ async fn push_package_api(put_url: &str, pkgpath: &str, access: &HubAccess) -> R
         .to_string();
     if pkgfile != pm.packagefile_name() {
         return Err(HubError::InvalidPackageName(format!(
-            "{pkgfile} invalid name"
+            "{pkgfile} invalid name {}",
+            pm.packagefile_name()
         )));
     }
 
+    tracing::debug!("get action token");
     let pkg_bytes = std::fs::read(pkgpath)?;
     let actiontoken = access.get_publish_token().await?;
-    let req = surf::put(put_url)
-        .content_type(mime::BYTE_STREAM)
-        .body_bytes(pkg_bytes)
-        .header("Authorization", &actiontoken);
-    let mut res = req
+
+    tracing::debug!(url = put_url, "put package");
+    let req = http::Request::put(put_url)
+        .header("Authorization", &actiontoken)
+        .header(http::header::CONTENT_TYPE, mime::OCTET_STREAM.as_str())
+        .body(pkg_bytes)
+        .map_err(|e| HubError::HubAccess(format!("request formatting error {e}")))?;
+    debug!("auth accepted");
+    let res = crate::htclient::send(req)
         .await
         .map_err(|e| HubError::HubAccess(format!("Failed to connect {e}")))?;
-
-    match res.status() {
-        surf::http::StatusCode::Ok => {
+    debug!(res=?res, "auth accepted");
+    let status = http::StatusCode::from_u16(res.status().as_u16())
+        .map_err(|e| HubError::General(format!("unknown status code: {e}")))?;
+    match status {
+        StatusCode::OK => {
             println!("Package uploaded!");
             Ok(())
         }
-        surf::http::StatusCode::Unauthorized => {
-            Err(HubError::HubAccess("Unauthorized, please log in".into()))
-        }
-        surf::http::StatusCode::Conflict => Err(HubError::PackageAlreadyPublished(
+        StatusCode::UNAUTHORIZED => Err(HubError::HubAccess("Unauthorized, please log in".into())),
+        StatusCode::CONFLICT => Err(HubError::PackageAlreadyPublished(
             "Make sure version is up to date and name doesn't conflicts with other package.".into(),
         )),
         _ => {
             debug!("push result: {} \n{res:?}", res.status());
             let bodymsg = res
                 .body_string()
-                .await
                 .map_err(|_e| HubError::HubAccess("Failed to download err body".into()))?;
-            let msg = format!("error status code({}) {}", res.status(), bodymsg);
+            let msg = format!("error status code({}) {}", status, bodymsg);
             Err(HubError::HubAccess(msg))
         }
     }

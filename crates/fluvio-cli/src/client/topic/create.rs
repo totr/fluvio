@@ -21,8 +21,12 @@ use fluvio::metadata::topic::CompressionAlgorithm;
 
 use fluvio_controlplane_metadata::topic::config::TopicConfig;
 use fluvio_sc_schema::shared::validate_resource_name;
+use fluvio_sc_schema::mirror::MirrorSpec;
+use fluvio_sc_schema::topic::HomeMirrorConfig;
+use fluvio_sc_schema::topic::MirrorConfig;
 
 use fluvio::Fluvio;
+use fluvio::FluvioAdmin;
 use fluvio::metadata::topic::TopicSpec;
 use crate::CliError;
 
@@ -83,9 +87,35 @@ pub struct CreateTopicOpt {
         value_name = "file.json",
         conflicts_with = "partitions",
         conflicts_with = "replication",
+        conflicts_with = "mirror_apply",
+        conflicts_with = "mirror",
         group = "config-arg"
     )]
     replica_assignment: Option<PathBuf>,
+
+    /// Mirror apply file
+    #[arg(
+        short = 'm',
+        long = "mirror-apply",
+        value_name = "file.json",
+        conflicts_with = "partitions",
+        conflicts_with = "replication",
+        conflicts_with = "replica_assignment",
+        conflicts_with = "mirror",
+        group = "config-arg"
+    )]
+    mirror_apply: Option<PathBuf>,
+
+    /// Flag for a mirror topic
+    #[arg(
+        long = "mirror",
+        conflicts_with = "partitions",
+        conflicts_with = "mirror_apply",
+        conflicts_with = "replication",
+        conflicts_with = "replica_assignment",
+        group = "config-arg"
+    )]
+    mirror: bool,
 
     /// Validates configuration, does not provision
     #[arg(short = 'd', long)]
@@ -100,33 +130,86 @@ pub struct CreateTopicOpt {
     /// or inside the topic configuration file in YAML format.
     #[arg(short, long, value_name = "PATH", conflicts_with = "config-arg")]
     config: Option<PathBuf>,
+
+    /// signify that this topic can be mirror from home to edge
+    #[arg(long)]
+    home_to_remote: bool,
 }
 
 impl CreateTopicOpt {
     pub async fn process(self, fluvio: &Fluvio) -> Result<()> {
         let dry_run = self.dry_run;
-        let (name, topic_spec) = self.construct()?;
+        let admin = fluvio.admin().await;
+        let (name, topic_spec) = self.construct(&admin).await?;
         validate(&name, &topic_spec)?;
 
         debug!("creating topic: {} spec: {:#?}", name, topic_spec);
-        let admin = fluvio.admin().await;
         admin.create(name.clone(), dry_run, topic_spec).await?;
         println!("topic \"{name}\" created");
 
         Ok(())
     }
 
-    fn construct(self) -> Result<(String, TopicSpec)> {
+    async fn construct(self, admin: &FluvioAdmin) -> Result<(String, TopicSpec)> {
         if let Some(config_path) = self.config {
             let config = TopicConfig::from_file(config_path)?;
             return Ok((config.meta.name.clone(), config.into()));
         }
 
+        let topic_name = self.topic.unwrap_or_default();
+
         use fluvio::metadata::topic::{PartitionMaps, TopicReplicaParam};
         use load::ReadFromJson;
 
         let replica_spec = if let Some(replica_assign_file) = &self.replica_assignment {
-            ReplicaSpec::Assigned(PartitionMaps::read_from_json_file(replica_assign_file)?)
+            ReplicaSpec::Assigned(PartitionMaps::read_from_json_file(
+                replica_assign_file,
+                &topic_name,
+            )?)
+        } else if let Some(mirror_assign_file) = &self.mirror_apply {
+            let mut config = MirrorConfig::read_from_json_file(mirror_assign_file, &topic_name)?;
+
+            config.set_home_to_remote(self.home_to_remote)?;
+
+            let targets = match config {
+                MirrorConfig::Home(ref c) => c
+                    .partitions()
+                    .iter()
+                    .map(|p| p.remote_cluster.clone())
+                    .collect::<Vec<String>>(),
+                MirrorConfig::Remote(_) => {
+                    return Err(
+                        CliError::InvalidArg("Invalid mirror configuration".to_string()).into(),
+                    )
+                }
+            };
+
+            // validate if all mirrors are registered
+            let mirrors = admin
+                .all::<MirrorSpec>()
+                .await?
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<String>>();
+            let not_registered_mirrors = targets
+                .iter()
+                .filter(|t| !mirrors.contains(t))
+                .collect::<Vec<&String>>();
+
+            if !not_registered_mirrors.is_empty() {
+                return Err(CliError::InvalidArg(format!(
+                    "Remote clusters not registered: {:?}",
+                    not_registered_mirrors
+                ))
+                .into());
+            }
+
+            ReplicaSpec::Mirror(config)
+        } else if self.mirror {
+            let mut home_mirror = HomeMirrorConfig::from(vec![]);
+            home_mirror.source = self.home_to_remote;
+            let mirror_map = MirrorConfig::Home(home_mirror);
+            ReplicaSpec::Mirror(mirror_map)
         } else {
             ReplicaSpec::Computed(TopicReplicaParam {
                 partitions: self.partitions,
@@ -146,6 +229,8 @@ impl CreateTopicOpt {
             topic_spec.set_compression_type(compression_type);
         }
 
+        topic_spec.set_system(self.setting.system);
+
         if self.setting.segment_size.is_some() || self.setting.max_partition_size.is_some() {
             let mut storage = TopicStorageConfig::default();
 
@@ -160,7 +245,7 @@ impl CreateTopicOpt {
             topic_spec.set_storage(storage);
         }
 
-        Ok((self.topic.unwrap_or_default(), topic_spec))
+        Ok((topic_name, topic_spec))
     }
 }
 
@@ -194,6 +279,11 @@ pub struct TopicConfigOpt {
     /// Ex: `2048`, '2 Ki', '10 MiB', `1 GB`
     #[arg(long, value_name = "bytes")]
     max_partition_size: Option<bytesize::ByteSize>,
+
+    /// Flag to create a system topic
+    /// System topics are for internal operations
+    #[arg(long, short = 's', hide = true)]
+    system: bool,
 }
 
 /// module to load partitions maps from file
@@ -203,36 +293,83 @@ mod load {
     use std::path::Path;
 
     use anyhow::{anyhow, Result};
-    use fluvio::metadata::topic::PartitionMaps;
+    use fluvio::metadata::topic::{PartitionMaps, MirrorConfig};
+    use fluvio_controlplane_metadata::topic::HomeMirrorConfig;
 
     pub(crate) trait ReadFromJson: Sized {
         /// Read and decode from json file
-        fn read_from_json_file<T: AsRef<Path>>(path: T) -> Result<Self>;
+        fn read_from_json_file<T: AsRef<Path>>(path: T, topic: &str) -> Result<Self>;
     }
 
     impl ReadFromJson for PartitionMaps {
-        fn read_from_json_file<T: AsRef<Path>>(path: T) -> Result<Self> {
+        fn read_from_json_file<T: AsRef<Path>>(path: T, _topic: &str) -> Result<Self> {
             let file_str: String = read_to_string(path)?;
             serde_json::from_str(&file_str)
                 .map_err(|err| anyhow!("error reading replica assignment: {err}"))
         }
     }
 
+    impl ReadFromJson for MirrorConfig {
+        fn read_from_json_file<T: AsRef<Path>>(path: T, topic: &str) -> Result<Self> {
+            let file_str: String = read_to_string(path)?;
+            let clusters: Vec<String> = serde_json::from_str(&file_str)
+                .map_err(|err| anyhow!("error reading mirror assignment: {err}"))?;
+            let core_mirror = HomeMirrorConfig::from_simple(topic, clusters);
+            Ok(MirrorConfig::Home(core_mirror))
+        }
+    }
+
     #[cfg(test)]
     mod test {
 
-        use fluvio_controlplane_metadata::topic::PartitionMaps;
+        use fluvio_controlplane_metadata::{
+            topic::{PartitionMaps, MirrorConfig},
+            partition::HomePartitionConfig,
+        };
 
         use super::ReadFromJson;
 
         #[test]
         fn test_replica_map_file() {
-            let p_map =
-                PartitionMaps::read_from_json_file("test-data/topics/replica_assignment.json")
-                    .expect("v1 not found");
+            let p_map = PartitionMaps::read_from_json_file(
+                "test-data/topics/replica_assignment.json",
+                "dummytopic",
+            )
+            .expect("v1 not found");
             assert_eq!(p_map.maps().len(), 3);
             assert_eq!(p_map.maps()[0].id, 0);
             assert_eq!(p_map.maps()[0].replicas, vec![5001, 5002, 5003]);
+        }
+
+        #[test]
+        fn test_mirror_map_file() {
+            let m = MirrorConfig::read_from_json_file(
+                "test-data/topics/mirror_assignment.json",
+                "boats",
+            )
+            .expect("v1 not found");
+            let core = match m {
+                MirrorConfig::Home(m) => m,
+                MirrorConfig::Remote(_) => panic!("not core"),
+            };
+            let partitions = core.partitions();
+            assert_eq!(partitions.len(), 2);
+            assert_eq!(
+                partitions[0],
+                HomePartitionConfig {
+                    remote_cluster: "boat1".to_string(),
+                    remote_replica: "boats-0".to_string(),
+                    ..Default::default()
+                }
+            );
+            assert_eq!(
+                partitions[1],
+                HomePartitionConfig {
+                    remote_cluster: "boat2".to_string(),
+                    remote_replica: "boats-0".to_string(),
+                    ..Default::default()
+                }
+            );
         }
     }
 }

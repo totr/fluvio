@@ -7,6 +7,9 @@ use futures_util::{Stream, StreamExt};
 use tracing::{debug, trace, instrument};
 use anyhow::{Result, anyhow};
 
+use fluvio_sc_schema::objects::ObjectApiUpdateRequest;
+use fluvio_sc_schema::objects::UpdateRequest;
+use fluvio_sc_schema::UpdatableAdminSpec;
 use fluvio_protocol::{Decoder, Encoder};
 use fluvio_protocol::api::{Request, RequestMessage};
 use fluvio_future::net::DomainConnector;
@@ -19,8 +22,9 @@ use fluvio_sc_schema::{AdminSpec, DeletableAdminSpec, CreatableAdminSpec, TryEnc
 use fluvio_socket::{ClientConfig, VersionedSerialSocket, SerialFrame, MultiplexerSocket};
 
 use crate::FluvioConfig;
-use crate::metadata::objects::{ListResponse, ListRequest};
 use crate::config::ConfigFile;
+use crate::error::anyhow_version_error;
+use crate::metadata::objects::{ListResponse, ListRequest};
 use crate::sync::MetadataStores;
 
 /// An interface for managing a Fluvio cluster
@@ -132,7 +136,8 @@ impl FluvioAdmin {
                 metadata,
             })
         } else {
-            Err(anyhow!("WatchApi version not found"))
+            let platform_version = versions.platform_version().to_string();
+            Err(anyhow_version_error(&platform_version))
         }
     }
 
@@ -185,7 +190,21 @@ impl FluvioAdmin {
     }
 
     /// Delete object by key
-    /// key is depend on spec, most are string but some allow multiple types
+    /// key is dependent on spec, most are string but some allow multiple types
+    ///
+    /// For example, to delete a topic:
+    ///
+    /// ```edition2021
+    /// use fluvio::Fluvio;
+    /// use fluvio::metadata::topic::TopicSpec;
+    ///
+    /// async fn delete_topic(name: String) -> anyhow::Result<()> {
+    ///     let fluvio = Fluvio::connect().await?;
+    ///     let admin = fluvio.admin().await;
+    ///     admin.delete::<TopicSpec>(name).await?;
+    ///     Ok(())
+    /// }
+    /// ```
     #[instrument(skip(self, key))]
     pub async fn delete<S>(&self, key: impl Into<S::DeleteKey>) -> Result<()>
     where
@@ -195,6 +214,58 @@ impl FluvioAdmin {
         debug!("sending delete request: {:#?}", delete_request);
 
         self.send_receive_admin::<ObjectApiDeleteRequest, _>(delete_request)
+            .await?
+            .as_result()?;
+        Ok(())
+    }
+
+    /// Forcibly delete object by key
+    /// key is dependent on spec, most are string but some allow multiple types.
+    ///
+    /// This method allows to delete objects marked as 'system'.
+    ///
+    /// For example, to delete a system topic:
+    ///
+    /// ```edition2021
+    /// use fluvio::Fluvio;
+    /// use fluvio::metadata::topic::TopicSpec;
+    ///
+    /// async fn delete_system_topic(name: String) -> anyhow::Result<()> {
+    ///     let fluvio = Fluvio::connect().await?;
+    ///     let admin = fluvio.admin().await;
+    ///     admin.force_delete::<TopicSpec>(name).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[instrument(skip(self, key))]
+    pub async fn force_delete<S>(&self, key: impl Into<S::DeleteKey>) -> Result<()>
+    where
+        S: DeletableAdminSpec + Sync + Send,
+    {
+        let delete_request: DeleteRequest<S> = DeleteRequest::with(key.into(), true);
+        debug!("sending force delete request: {:#?}", delete_request);
+
+        self.send_receive_admin::<ObjectApiDeleteRequest, _>(delete_request)
+            .await?
+            .as_result()?;
+        Ok(())
+    }
+
+    /// Update object by key
+    /// key is dependent on spec, most are string but some allow multiple types
+    #[instrument(skip(self, key))]
+    pub async fn update<S>(
+        &self,
+        key: impl Into<S::UpdateKey>,
+        action: S::UpdateAction,
+    ) -> Result<()>
+    where
+        S: UpdatableAdminSpec + Sync + Send,
+    {
+        let update_request: UpdateRequest<S> = UpdateRequest::new(key.into(), action);
+        debug!("sending update request: {:#?}", update_request);
+
+        self.send_receive_admin::<ObjectApiUpdateRequest, _>(update_request)
             .await?
             .as_result()?;
         Ok(())
@@ -235,8 +306,18 @@ impl FluvioAdmin {
         let filter_list: Vec<ListFilter> = filters.into_iter().map(Into::into).collect();
         let list_request: ListRequest<S> = ListRequest::new(filter_list, summary);
 
+        self.list_with_config(list_request).await
+    }
+
+    #[instrument(skip(self, config))]
+    pub async fn list_with_config<S, F>(&self, config: ListRequest<S>) -> Result<Vec<Metadata<S>>>
+    where
+        S: AdminSpec,
+        ListFilter: From<F>,
+        S::Status: Encoder + Decoder + Debug,
+    {
         let response = self
-            .send_receive_admin::<ObjectApiListRequest, _>(list_request)
+            .send_receive_admin::<ObjectApiListRequest, _>(config)
             .await?;
         trace!("list response: {:#?}", response);
         response
@@ -290,8 +371,8 @@ impl FluvioAdmin {
 #[cfg(feature = "unstable")]
 mod unstable {
     use super::*;
+    use fluvio_stream_dispatcher::metadata::local::LocalMetadataItem;
     use futures_util::Stream;
-    use crate::sync::AlwaysNewContext;
     use crate::metadata::topic::TopicSpec;
     use crate::metadata::partition::PartitionSpec;
     use crate::metadata::spu::SpuSpec;
@@ -301,19 +382,21 @@ mod unstable {
         /// Create a stream that yields updates to Topic metadata
         pub fn watch_topics(
             &self,
-        ) -> impl Stream<Item = MetadataChanges<TopicSpec, AlwaysNewContext>> {
+        ) -> impl Stream<Item = MetadataChanges<TopicSpec, LocalMetadataItem>> {
             self.metadata.topics().watch()
         }
 
         /// Create a stream that yields updates to Partition metadata
         pub fn watch_partitions(
             &self,
-        ) -> impl Stream<Item = MetadataChanges<PartitionSpec, AlwaysNewContext>> {
+        ) -> impl Stream<Item = MetadataChanges<PartitionSpec, LocalMetadataItem>> {
             self.metadata.partitions().watch()
         }
 
         /// Create a stream that yields updates to SPU metadata
-        pub fn watch_spus(&self) -> impl Stream<Item = MetadataChanges<SpuSpec, AlwaysNewContext>> {
+        pub fn watch_spus(
+            &self,
+        ) -> impl Stream<Item = MetadataChanges<SpuSpec, LocalMetadataItem>> {
             self.metadata.spus().watch()
         }
     }

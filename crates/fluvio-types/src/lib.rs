@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
+pub mod compression;
 pub mod defaults;
 pub mod macros;
 pub mod partition;
+pub mod config_file;
 
 #[cfg(feature = "events")]
 pub mod event;

@@ -54,6 +54,9 @@ pub enum ErrorCode {
     #[fluvio(tag = 61)]
     #[error("invalid Delete request")]
     InvalidDeleteRequest,
+    #[fluvio(tag = 71)]
+    #[error("Offset {offset} is evicted. The next available is {next_available}")]
+    OffsetEvicted { offset: i64, next_available: i64 },
 
     // Spu errors
     #[fluvio(tag = 1000)]
@@ -94,6 +97,12 @@ pub enum ErrorCode {
     #[fluvio(tag = 2006)]
     #[error("the topic name is invalid")]
     TopicInvalidName,
+    #[fluvio(tag = 2007)]
+    #[error("the topic was deleted")]
+    TopicDeleted,
+    #[fluvio(tag = 2008)]
+    #[error("the topic has invalid replica type")]
+    TopicInvalidReplicaType,
 
     // Partition errors
     #[fluvio(tag = 3000)]
@@ -107,13 +116,12 @@ pub enum ErrorCode {
     #[fluvio(tag = 3002)]
     #[error("the fetch session was not found")]
     FetchSessionNotFoud,
-
-    // Legacy SmartModule errors
-    #[cfg(feature = "smartmodule")]
-    #[deprecated(since = "0.9.13")]
-    #[fluvio(tag = 4000)]
-    #[error("a legacy SmartModule error occurred")]
-    LegacySmartModuleError(#[from] crate::smartmodule::LegacySmartModuleError),
+    #[fluvio(tag = 3003)]
+    #[error("offset flush error: {0}")]
+    OffsetFlushRequestError(String),
+    #[fluvio(tag = 3004)]
+    #[error("the offset management is disabled for the stream")]
+    OffsetManagementDisabled,
 
     // Managed Connector Errors
     #[fluvio(tag = 5000)]
@@ -195,6 +203,34 @@ pub enum ErrorCode {
     #[fluvio(tag = 10001)]
     #[error("Deduplication SmartModule name is invalid: {0}")]
     DeduplicationSmartModuleNameInvalid(String),
+
+    // Remote
+    #[fluvio(tag = 11001)]
+    #[error("the mirror was not found")]
+    MirrorNotFound,
+    #[fluvio(tag = 11002)]
+    #[error("the mirror already exists")]
+    MirrorAlreadyExists,
+    #[fluvio(tag = 11003)]
+    #[error("produce from home is not allowed")]
+    MirrorProduceFromHome,
+    #[fluvio(tag = 11004)]
+    #[error("delete from remote is not allowed")]
+    MirrorDeleteFromRemote,
+    #[fluvio(tag = 11005)]
+    #[error("the mirror is invalid")]
+    MirrorInvalidType,
+    #[fluvio(tag = 11006)]
+    #[error("produce from remote target is not allowed")]
+    MirrorProduceFromRemoteNotAllowed,
+
+    // Specs
+    #[fluvio(tag = 12001)]
+    #[error("system {kind} '{name}' can only be deleted forcibly")]
+    SystemSpecDeletionAttempt { kind: String, name: String },
+    #[fluvio(tag = 12002)]
+    #[error("system {kind} '{name}' can only be updated forcibly")]
+    SystemSpecUpdatingAttempt { kind: String, name: String },
 }
 
 impl ErrorCode {

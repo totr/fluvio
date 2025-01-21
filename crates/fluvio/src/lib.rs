@@ -1,9 +1,8 @@
 #![cfg_attr(
     feature = "nightly",
-    doc(include = "../../../website/kubernetes/INSTALL.md")
+    doc = include_str!("../../../DEVELOPER.md")
 )]
-
-#[doc = include_str!("../README.md")]
+#![doc = include_str!("../README.md")]
 
 mod admin;
 mod error;
@@ -20,9 +19,9 @@ pub mod spu;
 pub use error::FluvioError;
 pub use config::FluvioConfig;
 pub use producer::{
-    TopicProducerConfigBuilder, TopicProducerConfig, TopicProducer, RecordKey, ProduceOutput,
-    FutureRecordMetadata, RecordMetadata, DeliverySemantic, RetryPolicy, RetryStrategy,
-    Partitioner, PartitionerConfig, ProducerError,
+    TopicProducerConfigBuilder, TopicProducerConfig, TopicProducer, TopicProducerPool, RecordKey,
+    ProduceOutput, FutureRecordMetadata, RecordMetadata, DeliverySemantic, RetryPolicy,
+    RetryStrategy, Partitioner, PartitionerConfig, ProducerError,
 };
 #[cfg(feature = "smartengine")]
 pub use producer::{SmartModuleChainBuilder, SmartModuleConfig, SmartModuleInitialData};
@@ -46,6 +45,7 @@ use tracing::instrument;
 
 /// The minimum VERSION of the Fluvio Platform that this client is compatible with.
 const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
+pub(crate) const VERSION: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/VERSION"));
 
 /// Creates a producer that sends records to the named topic
 ///
@@ -108,13 +108,15 @@ const MINIMUM_PLATFORM_VERSION: &str = "0.9.0";
 ///
 /// [`Fluvio`]: ./struct.Fluvio.html
 #[instrument(skip(topic))]
-pub async fn producer(topic: impl Into<String>) -> anyhow::Result<TopicProducer> {
+pub async fn producer(
+    topic: impl Into<String>,
+) -> anyhow::Result<TopicProducer<spu::SpuSocketPool>> {
     let fluvio = Fluvio::connect().await?;
     let producer = fluvio.topic_producer(topic).await?;
     Ok(producer)
 }
 
-/// Creates a producer that receives events from the given topic and partition
+/// Creates a consumer that receives events from the given topic and partition
 ///
 /// This is a shortcut function that uses the current profile
 /// settings. If you need to specify any custom configurations,
@@ -141,7 +143,12 @@ pub async fn producer(topic: impl Into<String>) -> anyhow::Result<TopicProducer>
 /// ```
 ///
 /// [`Fluvio`]: ./struct.Fluvio.html
+#[deprecated(
+    since = "0.21.8",
+    note = "use `Fluvio::consumer_with_config()` instead"
+)]
 #[instrument(skip(topic, partition))]
+#[allow(deprecated)]
 pub async fn consumer(
     topic: impl Into<String>,
     partition: PartitionId,

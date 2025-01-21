@@ -8,8 +8,10 @@ pub mod versions;
 pub mod objects;
 pub mod shared;
 pub mod tableformat;
+pub mod mirror;
+pub mod mirroring;
 
-pub mod edge;
+pub mod remote_file;
 
 mod apis;
 mod request;
@@ -53,6 +55,9 @@ mod error {
                 }
                 ApiError::Code(ErrorCode::TopicNotFound, _) => {
                     write!(f, "Topic not found")
+                }
+                ApiError::Code(ErrorCode::MirrorNotFound, _) => {
+                    write!(f, "Mirror not found")
                 }
                 ApiError::Code(ErrorCode::SmartModuleNotFound { name: _ }, _) => {
                     write!(f, "SmartModule not found")
@@ -121,6 +126,11 @@ mod admin {
 
     pub trait DeletableAdminSpec: Spec + Encoder + Decoder {
         type DeleteKey: Encoder + Decoder + Debug + Default;
+    }
+
+    pub trait UpdatableAdminSpec: Spec + Encoder + Decoder {
+        type UpdateKey: Encoder + Decoder + Debug + Default;
+        type UpdateAction: Encoder + Decoder + Debug + Default + Clone;
     }
 
     /// try to encode type object into dynamic type which can be downcast later

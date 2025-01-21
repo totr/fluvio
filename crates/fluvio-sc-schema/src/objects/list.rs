@@ -68,6 +68,8 @@ pub struct ListRequest<S> {
     pub name_filters: ListFilters,
     #[fluvio(min_version = 10)]
     pub summary: bool, // if true, only return summary
+    #[fluvio(min_version = 13)]
+    pub system: bool, // if true, only return system specs
     data: PhantomData<S>, // satisfy generic
 }
 
@@ -76,8 +78,14 @@ impl<S> ListRequest<S> {
         Self {
             name_filters: name_filters.into(),
             summary,
+            system: false,
             data: PhantomData,
         }
+    }
+
+    pub fn system(mut self, system: bool) -> Self {
+        self.system = system;
+        self
     }
 }
 
@@ -100,6 +108,7 @@ where
 
 impl Request for ObjectApiListRequest {
     const API_KEY: u16 = AdminPublicApiKey::List as u16;
+    const MIN_API_VERSION: i16 = 15;
     const DEFAULT_API_VERSION: i16 = COMMON_VERSION;
     type Response = ObjectApiListResponse;
 }

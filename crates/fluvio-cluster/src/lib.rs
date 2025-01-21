@@ -34,6 +34,7 @@ mod delete;
 mod error;
 mod progress;
 pub mod runtime;
+mod process;
 
 /// extensions
 #[cfg(feature = "cli")]
@@ -57,9 +58,10 @@ pub use common::*;
 mod common {
 
     use std::{path::PathBuf, borrow::Cow};
-    use std::io::Error as IoError;
 
+    use anyhow::Result;
     use fluvio::config::{TlsPaths, TlsConfig};
+    use serde::{Serialize, Deserialize};
 
     /// The result of a successful startup of a Fluvio cluster
     ///
@@ -90,7 +92,7 @@ mod common {
     }
 
     /// User configuration chart location
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum UserChartLocation {
         /// Local charts must be located at a valid filesystem path.
         Local(PathBuf),
@@ -98,7 +100,7 @@ mod common {
         Remote(String),
     }
 
-    pub fn tls_config_to_cert_paths(config: &TlsConfig) -> Result<Cow<TlsPaths>, IoError> {
+    pub fn tls_config_to_cert_paths(config: &TlsConfig) -> Result<Cow<TlsPaths>> {
         use std::fs::write;
         use rand::distributions::Alphanumeric;
         use std::iter;

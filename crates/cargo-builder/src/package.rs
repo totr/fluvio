@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context};
 use cargo_metadata::{CargoOpt, MetadataCommand, Package};
 
+use crate::WASM_TARGET;
+
 #[derive(Debug)]
 pub struct PackageOption {
     pub release: String,
@@ -121,10 +123,20 @@ impl PackageInfo {
         Ok(path)
     }
 
+    /// path to package's wasm32-wasip1 target
+    pub fn target_wasm32_wasi_path(&self) -> anyhow::Result<PathBuf> {
+        let mut path = self.target_dir.clone();
+        path.push(WASM_TARGET);
+        path.push(&self.profile);
+        path.push(self.target_name()?.replace('-', "_"));
+        path.set_extension("wasm");
+        Ok(path)
+    }
+
     pub fn target_name(&self) -> anyhow::Result<&str> {
         self.package
             .targets
-            .get(0)
+            .first()
             .map(|target| target.name.as_str())
             .ok_or_else(|| anyhow!("package does not have any targets"))
     }
@@ -149,6 +161,7 @@ pub fn get_current_project_path() -> anyhow::Result<Option<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WASM_TARGET;
 
     #[test]
     fn test_package_info() {
@@ -167,14 +180,18 @@ mod tests {
         assert!(package_info
             .package_path()
             .ends_with("crates/cargo-builder"));
-        assert_eq!(package_info.target_name().unwrap(), "cargo-builder");
+        assert_eq!(package_info.target_name().unwrap(), "cargo_builder");
         assert!(package_info
             .target_bin_path()
             .unwrap()
-            .ends_with("x86_64-unknown-linux-gnu/release-lto/cargo-builder"));
+            .ends_with("x86_64-unknown-linux-gnu/release-lto/cargo_builder"));
         assert!(package_info
             .target_wasm32_path()
             .unwrap()
             .ends_with("wasm32-unknown-unknown/release-lto/cargo_builder.wasm"));
+        assert!(package_info
+            .target_wasm32_wasi_path()
+            .unwrap()
+            .ends_with(format!("{WASM_TARGET}/release-lto/cargo_builder.wasm")));
     }
 }

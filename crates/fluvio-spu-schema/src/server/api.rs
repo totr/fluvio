@@ -8,7 +8,7 @@ use std::fmt;
 use tracing::trace;
 
 use fluvio_protocol::bytes::Buf;
-use fluvio_protocol::{Encoder, Decoder};
+use fluvio_protocol::Decoder;
 use fluvio_protocol::api::ApiMessage;
 use fluvio_protocol::api::api_decode;
 use fluvio_protocol::api::RequestHeader;
@@ -21,27 +21,27 @@ use crate::ApiVersionsRequest;
 use super::SpuServerApiKey;
 use super::fetch_offset::FetchOffsetsRequest;
 use super::stream_fetch::FileStreamFetchRequest;
+use super::consumer_offset::{
+    UpdateConsumerOffsetRequest, DeleteConsumerOffsetRequest, FetchConsumerOffsetsRequest,
+};
 use super::update_offset::UpdateOffsetsRequest;
+use super::mirror::StartMirrorRequest;
 
 #[allow(clippy::large_enum_variant)]
 /// Request to Spu Server
-#[derive(Debug, Encoder)]
+#[derive(Debug)]
 pub enum SpuServerRequest {
-    /// list of versions supported
-    #[fluvio(tag = 0)]
     ApiVersionsRequest(RequestMessage<ApiVersionsRequest>),
 
-    // Kafka compatible requests
-    #[fluvio(tag = 1)]
     ProduceRequest(RequestMessage<DefaultProduceRequest>),
-    #[fluvio(tag = 2)]
     FileFetchRequest(RequestMessage<FileFetchRequest>),
-    #[fluvio(tag = 3)]
     FetchOffsetsRequest(RequestMessage<FetchOffsetsRequest>),
-    #[fluvio(tag = 4)]
     FileStreamFetchRequest(RequestMessage<FileStreamFetchRequest>),
-    #[fluvio(tag = 5)]
     UpdateOffsetsRequest(RequestMessage<UpdateOffsetsRequest>),
+    UpdateConsumerOffsetRequest(RequestMessage<UpdateConsumerOffsetRequest>),
+    DeleteConsumerOffsetRequest(RequestMessage<DeleteConsumerOffsetRequest>),
+    FetchConsumerOffsetsRequest(RequestMessage<FetchConsumerOffsetsRequest>),
+    StartMirrorRequest(RequestMessage<StartMirrorRequest>),
 }
 
 impl fmt::Display for SpuServerRequest {
@@ -53,6 +53,10 @@ impl fmt::Display for SpuServerRequest {
             Self::FetchOffsetsRequest(_) => write!(f, "FetchOffsetsRequest"),
             Self::FileStreamFetchRequest(_) => write!(f, "FileStreamFetchRequest"),
             Self::UpdateOffsetsRequest(_) => write!(f, "UpdateOffsetsRequest"),
+            Self::UpdateConsumerOffsetRequest(_) => write!(f, "UpdateConsumerOffsetRequest"),
+            Self::DeleteConsumerOffsetRequest(_) => write!(f, "DeleteConsumerOffsetRequest"),
+            Self::FetchConsumerOffsetsRequest(_) => write!(f, "FetchConsumerOffsetsRequest"),
+            Self::StartMirrorRequest(_) => write!(f, "StartMirrorRequest"),
         }
     }
 }
@@ -85,6 +89,16 @@ impl ApiMessage for SpuServerRequest {
             SpuServerApiKey::FetchOffsets => api_decode!(Self, FetchOffsetsRequest, src, header),
             SpuServerApiKey::StreamFetch => api_decode!(Self, FileStreamFetchRequest, src, header),
             SpuServerApiKey::UpdateOffsets => api_decode!(Self, UpdateOffsetsRequest, src, header),
+            SpuServerApiKey::UpdateConsumerOffset => {
+                api_decode!(Self, UpdateConsumerOffsetRequest, src, header)
+            }
+            SpuServerApiKey::DeleteConsumerOffset => {
+                api_decode!(Self, DeleteConsumerOffsetRequest, src, header)
+            }
+            SpuServerApiKey::FetchConsumerOffsets => {
+                api_decode!(Self, FetchConsumerOffsetsRequest, src, header)
+            }
+            SpuServerApiKey::StartMirror => api_decode!(Self, StartMirrorRequest, src, header),
         }
     }
 }

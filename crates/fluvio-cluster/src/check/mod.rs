@@ -7,15 +7,17 @@ use std::time::Duration;
 
 pub mod render;
 
+use anyhow::Result;
 use colored::Colorize;
 use fluvio_future::timer::sleep;
+use fluvio_types::config_file::SaveLoadConfig;
 use indicatif::style::TemplateError;
 use tracing::{error, debug};
 use async_trait::async_trait;
 use url::ParseError;
 use semver::Version;
 use serde_json::Error as JsonError;
-use sysinfo::{ProcessExt, System, SystemExt};
+use sysinfo::System;
 
 use fluvio_helm::{HelmClient, HelmError};
 use k8_config::{ConfigError as K8ConfigError, K8Config};
@@ -24,6 +26,7 @@ use crate::charts::{DEFAULT_HELM_VERSION, APP_CHART_NAME};
 use crate::progress::ProgressBarFactory;
 use crate::render::ProgressRenderer;
 use crate::charts::{ChartConfig, ChartInstaller, ChartInstallError, SYS_CHART_NAME};
+use crate::LocalConfig;
 
 const KUBE_VERSION: &str = "1.7.0";
 const RESOURCE_SERVICE: &str = "service";
@@ -36,7 +39,7 @@ const RESOURCE_SERVICE_ACCOUNT: &str = "secret";
 /// captured by the `Ok` variant of a `CheckResult`, since the check completed
 /// successfully. If the process of performing the check is what fails, we get
 /// an `Err`.
-pub type CheckResult = std::result::Result<CheckStatus, ClusterCheckError>;
+pub type CheckResult = Result<CheckStatus>;
 
 /// A collection of the successes, failures, and errors of running checks
 pub type CheckResults = Vec<CheckResult>;
@@ -226,8 +229,20 @@ pub enum UnrecoverableCheckStatus {
     #[error("Unhandled K8 client error: {0}")]
     UnhandledK8ClientError(String),
 
-    #[error("Local Fluvio component still exists")]
+    #[error("Local Fluvio cluster still running")]
     ExistingLocalCluster,
+
+    #[error("Local Fluvio cluster wasn't deleted. Use 'resume' to resume created cluster or 'delete' before starting a new one")]
+    CreateLocalConfigError,
+
+    /// The installed version of the local cluster is incompatible
+    #[error("Check Versions match failed: cannot resume a {installed} cluster with fluvio version {required}.\nShutdown the cluster with \"fluvio cluster shutdown\" and use \"fluvio cluster upgrade\" to update to the new version")]
+    IncompatibleLocalClusterVersion {
+        /// The currently-installed version
+        installed: String,
+        /// The required version
+        required: String,
+    },
 
     #[error("Helm client error")]
     HelmClientError,
@@ -268,13 +283,13 @@ pub trait ClusterCheck: Debug + 'static + Send + Sync {
     }
 
     /// perform check, if successful return success message, if fail, return
-    async fn perform_check(&self, pb: &ProgressRenderer) -> Result<CheckStatus, ClusterCheckError>;
+    async fn perform_check(&self, pb: &ProgressRenderer) -> Result<CheckStatus>;
 }
 
 #[async_trait]
 pub trait ClusterAutoFix: Debug + 'static + Send + Sync {
     /// Attempt to fix a recoverable error. return string
-    async fn attempt_fix(&self, render: &ProgressRenderer) -> Result<String, ClusterAutoFixError>;
+    async fn attempt_fix(&self, render: &ProgressRenderer) -> Result<String>;
 }
 
 /// Check for loading
@@ -498,7 +513,7 @@ impl ClusterCheck for SysChartCheck {
                 UnrecoverableCheckStatus::MultipleSystemCharts,
             ))
         } else {
-            let install_chart = sys_charts.get(0).unwrap();
+            let install_chart = sys_charts.first().unwrap();
             debug!(app_version = %install_chart.app_version,"Sys Chart Version");
             let existing_platform_version = Version::parse(&install_chart.app_version)?;
             if existing_platform_version == self.platform_version {
@@ -542,7 +557,7 @@ pub(crate) struct InstallSysChart {
 
 #[async_trait]
 impl ClusterAutoFix for InstallSysChart {
-    async fn attempt_fix(&self, _render: &ProgressRenderer) -> Result<String, ClusterAutoFixError> {
+    async fn attempt_fix(&self, _render: &ProgressRenderer) -> Result<String> {
         debug!(
             "Fixing by installing Fluvio sys chart with config: {:#?}",
             &self.config
@@ -565,7 +580,7 @@ pub(crate) struct UpgradeSysChart {
 
 #[async_trait]
 impl ClusterAutoFix for UpgradeSysChart {
-    async fn attempt_fix(&self, _render: &ProgressRenderer) -> Result<String, ClusterAutoFixError> {
+    async fn attempt_fix(&self, _render: &ProgressRenderer) -> Result<String> {
         debug!(
             "Fixing by updating Fluvio sys chart with config: {:#?}",
             &self.config
@@ -671,11 +686,12 @@ struct LocalClusterCheck;
 #[async_trait]
 impl ClusterCheck for LocalClusterCheck {
     async fn perform_check(&self, _pb: &ProgressRenderer) -> CheckResult {
+        sysinfo::set_open_files_limit(0);
         let mut sys = System::new();
-        sys.refresh_processes(); // Only load what we need.
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All); // Only load what we need.
         let proc_count = sys
-            .processes_by_exact_name("fluvio-run")
-            .map(|x| debug!("Found existing fluvio-run process. pid: {}", x.pid()))
+            .processes_by_exact_name("fluvio-run".as_ref())
+            .map(|x| println!("       found existing fluvio-run process. pid: {}", x.pid()))
             .count();
         if proc_count > 0 {
             return Ok(CheckStatus::Unrecoverable(
@@ -687,6 +703,69 @@ impl ClusterCheck for LocalClusterCheck {
 
     fn label(&self) -> &str {
         "Fluvio Local Installation"
+    }
+}
+
+/// check for non deleted local cluster
+#[derive(Debug)]
+struct CleanLocalClusterCheck;
+
+#[async_trait]
+impl ClusterCheck for CleanLocalClusterCheck {
+    async fn perform_check(&self, _pb: &ProgressRenderer) -> CheckResult {
+        use crate::start::local::LOCAL_CONFIG_PATH;
+
+        let can_create_config = LOCAL_CONFIG_PATH
+            .as_ref()
+            .map(|p| !p.is_file())
+            .unwrap_or(false);
+        if !can_create_config {
+            return Ok(CheckStatus::Unrecoverable(
+                UnrecoverableCheckStatus::CreateLocalConfigError,
+            ));
+        }
+
+        Ok(CheckStatus::pass(
+            "Previous local fluvio installation not found",
+        ))
+    }
+
+    fn label(&self) -> &str {
+        "Clean Fluvio Local Installation"
+    }
+}
+
+// Check local cluster is installed with a compatible version
+#[derive(Debug)]
+struct LocalClusterVersionCheck(Version);
+
+#[async_trait]
+impl ClusterCheck for LocalClusterVersionCheck {
+    async fn perform_check(&self, _pb: &ProgressRenderer) -> CheckResult {
+        use crate::start::local::LOCAL_CONFIG_PATH;
+
+        let installed_version = LOCAL_CONFIG_PATH
+            .as_ref()
+            .and_then(|p| LocalConfig::load_from(p).ok())
+            .map(|conf| conf.platform_version().clone())
+            .ok_or(anyhow::Error::msg(
+                "Could not load local config's platform version",
+            ))?;
+
+        if installed_version != self.0 {
+            Ok(CheckStatus::Unrecoverable(
+                UnrecoverableCheckStatus::IncompatibleLocalClusterVersion {
+                    installed: installed_version.to_string(),
+                    required: self.0.to_string(),
+                },
+            ))
+        } else {
+            Ok(CheckStatus::pass("Platform versions match"))
+        }
+    }
+
+    fn label(&self) -> &str {
+        "Versions match"
     }
 }
 
@@ -744,10 +823,21 @@ impl ClusterChecker {
         self
     }
 
-    pub fn with_no_k8_checks(mut self) -> Self {
-        let checks: Vec<Box<(dyn ClusterCheck)>> = vec![Box::new(LocalClusterCheck)];
-        self.checks.extend(checks);
-        self
+    pub fn with_no_k8_checks(self) -> Self {
+        self.without_installed_local_cluster()
+            .with_clean_local_cluster()
+    }
+
+    pub fn without_installed_local_cluster(self) -> Self {
+        self.with_check(LocalClusterCheck)
+    }
+
+    pub fn with_clean_local_cluster(self) -> Self {
+        self.with_check(CleanLocalClusterCheck)
+    }
+
+    pub fn with_local_cluster_version(self, version: Version) -> Self {
+        self.with_check(LocalClusterVersionCheck(version))
     }
 
     /// Adds all checks required for starting a cluster on minikube.
@@ -782,11 +872,7 @@ impl ClusterChecker {
     }
 
     /// Performs checks and fixes as required.
-    pub async fn run(
-        self,
-        pb_factory: &ProgressBarFactory,
-        fix_recoverable: bool,
-    ) -> Result<bool, ClusterCheckError> {
+    pub async fn run(self, pb_factory: &ProgressBarFactory, fix_recoverable: bool) -> Result<bool> {
         macro_rules! pad_format {
             ( $e:expr ) => {
                 format!("{:>3} {}", "", $e)
@@ -889,7 +975,7 @@ impl ClusterChecker {
 
         if failed {
             pb_factory.println(format!("💔 {}", "Some pre-flight check failed!".bold()));
-            Err(ClusterCheckError::PreCheckFlightFailure)
+            Err(ClusterCheckError::PreCheckFlightFailure.into())
         } else {
             pb_factory.println(format!("🎉 {}", "All checks passed!".bold()));
             Ok(true)
@@ -939,7 +1025,7 @@ fn check_permission(resource: &str, _pb: &ProgressRenderer) -> CheckResult {
     Ok(CheckStatus::pass(format!("Can create {resource}")))
 }
 
-fn check_create_permission(resource: &str) -> Result<bool, ClusterCheckError> {
+fn check_create_permission(resource: &str) -> Result<bool> {
     let check_command = Command::new("kubectl")
         .arg("auth")
         .arg("can-i")

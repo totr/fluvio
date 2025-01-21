@@ -6,16 +6,19 @@ mod utils;
 #[cfg(feature = "connector-cmds")]
 pub mod cmd;
 
+pub mod htclient;
 pub mod keymgmt;
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod fvm;
 
 use const_format::concatcp;
 
+pub use http;
 pub use hubaccess::*;
 pub use package::*;
 pub use package_meta_ext::*;
 pub use utils::*;
-pub use surf as http;
 pub use utils::sha256_digest;
 
 pub use fluvio_hub_protocol::*;

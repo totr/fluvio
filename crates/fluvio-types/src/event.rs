@@ -6,9 +6,6 @@ use event_listener::Event;
 
 const DEFAULT_EVENT_ORDERING: Ordering = Ordering::SeqCst;
 
-#[deprecated(since = "0.2.5", note = "use StickyEvent instead")]
-pub use StickyEvent as SimpleEvent;
-
 #[derive(Debug)]
 pub struct StickyEvent {
     flag: AtomicBool,
@@ -56,14 +53,19 @@ impl StickyEvent {
 
 pub mod offsets {
     use std::fmt;
-    use std::pin::Pin;
     use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Weak};
 
     use tracing::trace;
     use event_listener::{Event, EventListener};
 
+    pub type SharedOffsetPublisher = Arc<OffsetPublisher>;
+    pub type WeakSharedOffsetPublisher = Weak<OffsetPublisher>;
+
     const DEFAULT_EVENT_ORDERING: Ordering = Ordering::SeqCst;
+
+    pub const INIT_OFFSET: i64 = -1;
+    pub const TOPIC_DELETED: i64 = -2;
 
     /// publish current offsets to listeners
     #[derive(Debug)]
@@ -89,7 +91,7 @@ pub mod offsets {
             self.current_value.load(DEFAULT_EVENT_ORDERING)
         }
 
-        fn listen(&self) -> Pin<Box<EventListener>> {
+        fn listen(&self) -> EventListener {
             self.event.listen()
         }
 

@@ -3,6 +3,7 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use std::borrow::Cow;
 use std::process::Child;
@@ -14,7 +15,7 @@ use std::time::SystemTime;
 use anyhow::{anyhow, Result};
 use derive_builder::Builder;
 use k8_client::meta_client::NameSpace;
-use tracing::{info, warn, debug, instrument};
+use tracing::{info, warn, error, debug, instrument};
 use once_cell::sync::Lazy;
 use tempfile::NamedTempFile;
 use semver::Version;
@@ -40,7 +41,6 @@ use k8_types::core::node::{NodeSpec, NodeAddress};
 use fluvio_command::CommandExt;
 
 use crate::InstallationType;
-use crate::check::ClusterCheckError;
 use crate::check::{AlreadyInstalled, SysChartCheck};
 use crate::error::K8InstallError;
 use crate::progress::ProgressBarFactory;
@@ -48,7 +48,7 @@ use crate::render::ProgressRenderedText;
 use crate::render::ProgressRenderer;
 use crate::start::common::check_crd;
 use crate::tls_config_to_cert_paths;
-use crate::{ClusterError, StartStatus, DEFAULT_NAMESPACE, ClusterChecker};
+use crate::{StartStatus, DEFAULT_NAMESPACE, ClusterChecker};
 use crate::charts::{ChartConfig, ChartInstaller};
 use crate::UserChartLocation;
 use crate::progress::InstallProgressMessage;
@@ -90,7 +90,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .namespace("my-namespace")
     ///     .build()?;
@@ -113,7 +113,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .image_tag("0.6.0")
     ///     .build()?;
@@ -145,7 +145,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .image_registry("localhost:5000/infinyon")
     ///     .build()?;
@@ -171,7 +171,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .group_name("orange")
     ///     .build()?;
@@ -187,7 +187,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .spu_replicas(2)
     ///     .build()?;
@@ -202,7 +202,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .rust_log("debug")
     ///     .build()?;
@@ -228,7 +228,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .authorization_config_map("authorization")
     ///     .build()?;
@@ -244,7 +244,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .save_profile(true)
     ///     .build()?;
@@ -261,7 +261,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .install_sys(false)
     ///     .build()?;
@@ -279,7 +279,7 @@ pub struct ClusterConfig {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .skip_checks(true)
     ///     .build()?;
@@ -350,7 +350,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// use semver::Version;
     /// let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap()).build()?;
     /// # Ok(())
@@ -358,7 +358,7 @@ impl ClusterConfigBuilder {
     /// ```
     ///
     /// [`ClusterInstaller`]: ./struct.ClusterInstaller.html
-    pub fn build(&self) -> Result<ClusterConfig, ClusterError> {
+    pub fn build(&self) -> Result<ClusterConfig> {
         let config = self
             .build_impl()
             .map_err(|err| K8InstallError::MissingRequiredConfig(err.to_string()))?;
@@ -372,7 +372,7 @@ impl ClusterConfigBuilder {
     /// previously assigned.
     ///
     /// - Use the git hash of HEAD as the image_tag
-    pub fn development(&mut self) -> Result<&mut Self, ClusterError> {
+    pub fn development(&mut self) -> Result<&mut Self> {
         // look at git version instead of compiling git version which may not be same as image version
         let git_version_output = Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -399,7 +399,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .local_chart("./k8-util/helm")
     ///     .build()?;
@@ -428,7 +428,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// let config = builder
     ///     .remote_chart("https://charts.fluvio.io")
     ///     .build()?;
@@ -450,7 +450,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterConfig, ClusterConfigBuilder, ClusterError};
-    /// # fn example(builder: &mut ClusterConfigBuilder) -> Result<(), ClusterError> {
+    /// # fn example(builder: &mut ClusterConfigBuilder) -> anyhow::Result<()> {
     /// use std::path::PathBuf;
     /// use fluvio::config::TlsPaths;
     /// use semver::Version;
@@ -511,7 +511,7 @@ impl ClusterConfigBuilder {
     ///
     /// ```
     /// # use fluvio_cluster::{ClusterError, ClusterConfig};
-    /// # fn example() -> Result<(), ClusterError> {
+    /// # fn example() -> anyhow::Result<()> {
     /// use semver::Version;
     /// let custom_namespace = false;
     /// let config = ClusterConfig::builder(Version::parse("0.7.0-alpha.1").unwrap())
@@ -581,8 +581,15 @@ impl ClusterInstaller {
     /// # }
     /// ```
     pub fn from_config(config: ClusterConfig) -> Result<Self> {
+        let kube_client = load_and_share().map_err(|k8_err| {
+            let msg =
+                format!("unable to load kubectl context to access k8 cluster\nError: {k8_err:?}\n");
+            error!(target: "kubectl", msg);
+            anyhow!(msg)
+        })?;
+
         Ok(Self {
-            kube_client: load_and_share()?,
+            kube_client,
             pb_factory: ProgressBarFactory::new(config.hide_spinner),
             config,
         })
@@ -598,7 +605,7 @@ impl ClusterInstaller {
     ///
     /// [`system_chart`]: ./struct.ClusterInstaller.html#method.system_chart
     #[instrument(skip(self))]
-    pub async fn preflight_check(&self, fix: bool) -> Result<(), ClusterCheckError> {
+    pub async fn preflight_check(&self, fix: bool) -> Result<()> {
         const DISPATCHER_WAIT: &str = "FLV_DISPATCHER_WAIT";
 
         // HACK. set FLV_DISPATCHER if not set
@@ -801,7 +808,17 @@ impl ClusterInstaller {
 
             debug!(?helm_lb_config, "helm_lb_config");
 
-            serde_yaml::to_writer(&np_addr_fd, &helm_lb_config)?;
+            let helm_values: String = serde_yaml::to_string(&helm_lb_config).map_err(|e| {
+                debug!(
+                    ?helm_lb_config,
+                    "couldn't serialize helm load balancer config"
+                );
+                anyhow!("couldn't serialize helm yaml {e:?}")
+            })?;
+            debug!(%helm_values, "helm_values");
+            write!(&np_addr_fd, "{helm_values}")
+                .map_err(|e| anyhow!("Error writing helm values file\n{e}"))?;
+
             Some((np_addr_fd, np_conf_path))
         } else {
             None

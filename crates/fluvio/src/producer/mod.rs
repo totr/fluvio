@@ -1,3 +1,12 @@
+//! The Fluvio Producer module allows applications to send messages to topics in the Fluvio cluster.
+//!
+//! # Overview
+//!
+//! This module provides the necessary structures and functions to produce messages to a Fluvio topic.
+//! It includes the `TopicProducerPool` struct, which manages the production of messages
+//! to specific topics and partitions, respectively.
+//!
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tracing::instrument;
@@ -7,6 +16,7 @@ use anyhow::Result;
 use fluvio_protocol::record::ReplicaKey;
 use fluvio_protocol::record::Record;
 use fluvio_compression::Compression;
+#[cfg(feature = "compress")]
 use fluvio_sc_schema::topic::CompressionAlgorithm;
 use fluvio_types::PartitionId;
 use fluvio_types::event::StickyEvent;
@@ -24,15 +34,17 @@ pub mod event;
 
 pub use fluvio_protocol::record::{RecordKey, RecordData};
 
+use crate::spu::SpuPool;
+use crate::spu::SpuSocketPool;
 use crate::FluvioError;
 use crate::metrics::ClientMetrics;
-use crate::spu::SpuPool;
 use crate::producer::accumulator::{RecordAccumulator, PushRecord};
-pub use crate::producer::partitioning::{Partitioner, PartitionerConfig};
-#[cfg(feature = "stats")]
-use crate::stats::{ClientStats, ClientStatsDataCollect, metrics::ClientStatsDataFrame};
 
+pub use crate::producer::partitioning::{Partitioner, PartitionerConfig};
+
+use self::accumulator::BatchEvents;
 use self::accumulator::BatchHandler;
+use self::accumulator::BatchesDeque;
 pub use self::config::{
     TopicProducerConfigBuilder, TopicProducerConfig, TopicProducerConfigBuilderError,
     DeliverySemantic, RetryPolicy, RetryStrategy,
@@ -44,43 +56,65 @@ use self::partition_producer::PartitionProducer;
 pub use self::record::{FutureRecordMetadata, RecordMetadata};
 
 /// Pool of producers for a given topic. There is a producer per partition
+pub type TopicProducerPool = TopicProducer<SpuSocketPool>;
+
+/// Pool of producers for a given topic. There is a producer per partition
 struct ProducerPool {
-    flush_events: Vec<(Arc<EventHandler>, Arc<EventHandler>)>,
-    end_events: Vec<Arc<StickyEvent>>,
-    errors: Vec<Arc<RwLock<Option<ProducerError>>>>,
+    flush_events: HashMap<PartitionId, (Arc<EventHandler>, Arc<EventHandler>)>,
+    end_events: HashMap<PartitionId, Arc<StickyEvent>>,
+    errors: HashMap<PartitionId, Arc<RwLock<Option<ProducerError>>>>,
+}
+
+#[derive(Clone)]
+struct PartitionProducerParams<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
+    config: Arc<TopicProducerConfig>,
+    spu_pool: Arc<S>,
+    batches_deque: Arc<BatchesDeque>,
+    batch_events: Arc<BatchEvents>,
+    client_metric: Arc<ClientMetrics>,
 }
 
 impl ProducerPool {
-    fn new(
+    fn new<S>(
         config: Arc<TopicProducerConfig>,
         topic: String,
-        spu_pool: Arc<SpuPool>,
-        batches: Arc<Vec<BatchHandler>>,
+        spu_pool: Arc<S>,
+        batches: Arc<HashMap<PartitionId, BatchHandler>>,
         client_metric: Arc<ClientMetrics>,
-    ) -> Self {
-        let mut end_events = vec![];
-        let mut flush_events = vec![];
-        let mut errors = vec![];
-        for (partition_id, (batch_events, batch_list)) in batches.iter().enumerate() {
+    ) -> Self
+    where
+        S: SpuPool + Send + Sync + 'static,
+    {
+        let mut end_events = HashMap::new();
+        let mut flush_events = HashMap::new();
+        let mut errors = HashMap::new();
+        for (partition_id, (batch_events, batch_list)) in batches.iter() {
             let end_event = StickyEvent::shared();
             let flush_event = (EventHandler::shared(), EventHandler::shared());
-            let replica = ReplicaKey::new(topic.clone(), partition_id as PartitionId);
+            let replica = ReplicaKey::new(topic.clone(), *partition_id);
             let error = Arc::new(RwLock::new(None));
 
+            let params = PartitionProducerParams {
+                config: config.clone(),
+                spu_pool: spu_pool.clone(),
+                batches_deque: batch_list.clone(),
+                batch_events: batch_events.clone(),
+                client_metric: client_metric.clone(),
+            };
+
             PartitionProducer::start(
-                config.clone(),
-                replica,
-                spu_pool.clone(),
-                batch_list.clone(),
-                batch_events.clone(),
+                params,
                 error.clone(),
                 end_event.clone(),
                 flush_event.clone(),
-                client_metric.clone(),
+                replica,
             );
-            errors.push(error);
-            end_events.push(end_event);
-            flush_events.push(flush_event);
+            errors.insert(*partition_id, error);
+            end_events.insert(*partition_id, end_event);
+            flush_events.insert(*partition_id, flush_event);
         }
         Self {
             end_events,
@@ -89,24 +123,44 @@ impl ProducerPool {
         }
     }
 
-    fn shared(
-        config: Arc<TopicProducerConfig>,
+    async fn ensure_partition_producer<S>(
+        &mut self,
+        params: PartitionProducerParams<S>,
         topic: String,
-        spu_pool: Arc<SpuPool>,
-        batches: Arc<Vec<BatchHandler>>,
-        client_metric: Arc<ClientMetrics>,
-    ) -> Arc<Self> {
-        Arc::new(ProducerPool::new(
-            config,
-            topic,
-            spu_pool,
-            batches,
-            client_metric,
-        ))
+        partition_id: PartitionId,
+        record_accumulator: Arc<RecordAccumulator>,
+    ) where
+        S: SpuPool + Send + Sync + 'static,
+    {
+        if self.flush_events.contains_key(&partition_id) {
+            return;
+        }
+        record_accumulator
+            .add_partition(
+                partition_id,
+                (params.batch_events.clone(), params.batches_deque.clone()),
+            )
+            .await;
+
+        let end_event = StickyEvent::shared();
+        let flush_event = (EventHandler::shared(), EventHandler::shared());
+        let replica = ReplicaKey::new(topic.clone(), partition_id);
+        let error: Arc<RwLock<Option<ProducerError>>> = Arc::new(RwLock::new(None));
+
+        PartitionProducer::start(
+            params,
+            error.clone(),
+            end_event.clone(),
+            flush_event.clone(),
+            replica,
+        );
+        self.errors.insert(partition_id, error);
+        self.end_events.insert(partition_id, end_event);
+        self.flush_events.insert(partition_id, flush_event);
     }
 
     async fn flush_all_batches(&self) -> Result<()> {
-        for ((manual_flush_notifier, batch_flushed_event), error) in
+        for ((_, (manual_flush_notifier, batch_flushed_event)), (_, error)) in
             self.flush_events.iter().zip(self.errors.iter())
         {
             let listener = batch_flushed_event.listen();
@@ -124,21 +178,21 @@ impl ProducerPool {
     }
 
     async fn last_error(&self, partition_id: PartitionId) -> Option<ProducerError> {
-        let error = self.errors[partition_id as usize].read().await;
+        let error = self.errors.get(&partition_id)?.read().await;
         error.clone()
     }
 
     async fn clear_errors(&self) {
-        for error in self.errors.iter() {
+        for (_, error) in self.errors.iter() {
             let mut error_handle = error.write().await;
             *error_handle = None;
         }
     }
 
     fn end(&self) {
-        for event in &self.end_events {
+        self.end_events.iter().for_each(|(_, event)| {
             event.notify();
-        }
+        });
     }
 }
 
@@ -152,33 +206,43 @@ impl Drop for ProducerPool {
 ///
 /// A `TopicProducer` allows you to send events to the specific
 /// topic it was initialized for. Once you have a `TopicProducer`,
-/// you can send events to the topic, choosing which partition
-/// each event should be delivered to.
-pub struct TopicProducer {
-    inner: Arc<InnerTopicProducer>,
+/// you can send events to the topic, choosing which partition /// each event should be delivered to.
+#[derive(Clone)]
+pub struct TopicProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
+    inner: Arc<InnerTopicProducer<S>>,
     #[cfg(feature = "smartengine")]
     sm_chain: Option<Arc<RwLock<fluvio_smartengine::SmartModuleChainInstance>>>,
     #[allow(unused)]
     metrics: Arc<ClientMetrics>,
 }
 
-struct InnerTopicProducer {
+struct InnerTopicProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
     config: Arc<TopicProducerConfig>,
     topic: String,
-    spu_pool: Arc<SpuPool>,
-    record_accumulator: RecordAccumulator,
-    producer_pool: Arc<ProducerPool>,
+    spu_pool: Arc<S>,
+    record_accumulator: Arc<RecordAccumulator>,
+    producer_pool: Arc<RwLock<ProducerPool>>,
+    metrics: Arc<ClientMetrics>,
 }
 
-impl InnerTopicProducer {
+impl<S> InnerTopicProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
     /// Flush all the PartitionProducers and wait for them.
     async fn flush(&self) -> Result<()> {
-        self.producer_pool.flush_all_batches().await?;
+        self.producer_pool.read().await.flush_all_batches().await?;
         Ok(())
     }
 
     async fn push_record(self: Arc<Self>, record: Record) -> Result<PushRecord> {
-        let topics = self.spu_pool.metadata.topics();
+        let topics = self.spu_pool.topics();
 
         let topic_spec = topics
             .lookup_by_key(&self.topic)
@@ -195,9 +259,28 @@ impl InnerTopicProducer {
             .partitioner
             .partition(&partition_config, key, value);
 
-        if let Some(error) = self.producer_pool.last_error(partition).await {
+        let mut producer_pool = self.producer_pool.write().await;
+
+        if let Some(error) = producer_pool.last_error(partition).await {
             return Err(error.into());
         }
+
+        let params = PartitionProducerParams {
+            config: self.config.clone(),
+            spu_pool: self.spu_pool.clone(),
+            batches_deque: BatchesDeque::shared(),
+            batch_events: BatchEvents::shared(),
+            client_metric: self.metrics.clone(),
+        };
+
+        let _ = producer_pool
+            .ensure_partition_producer(
+                params,
+                self.topic.clone(),
+                partition,
+                self.record_accumulator.clone(),
+            )
+            .await;
 
         let push_record = self
             .record_accumulator
@@ -208,7 +291,7 @@ impl InnerTopicProducer {
     }
 
     async fn clear_errors(&self) {
-        self.producer_pool.clear_errors().await;
+        self.producer_pool.read().await.clear_errors().await;
     }
 }
 
@@ -227,7 +310,10 @@ cfg_if::cfg_if! {
             fluvio_smartengine::SmartEngine::new()
         });
 
-        impl TopicProducer {
+        impl<S> TopicProducer<S>
+            where
+                S: SpuPool + Send + Sync + 'static,
+        {
             /// Adds a chain of SmartModules to this TopicProducer
             pub async fn with_chain(mut self, chain_builder: SmartModuleChainBuilder) -> Result<Self> {
                 let mut chain_instance = chain_builder.initialize(&SM_ENGINE).map_err(|e| FluvioError::Other(format!("SmartEngine - {e:?}")))?;
@@ -308,69 +394,44 @@ cfg_if::cfg_if! {
     }
 }
 
-impl TopicProducer {
+impl<S> TopicProducer<S>
+where
+    S: SpuPool + Send + Sync + 'static,
+{
     pub(crate) async fn new(
         topic: String,
-        spu_pool: Arc<SpuPool>,
-        config: TopicProducerConfig,
+        spu_pool: Arc<S>,
+        config: Arc<TopicProducerConfig>,
         metrics: Arc<ClientMetrics>,
     ) -> Result<Self> {
-        let config = Arc::new(config);
-        let topics = spu_pool.metadata.topics();
-        let topic_spec = topics
+        let topics = spu_pool.topics();
+        let topic_spec: fluvio_sc_schema::topic::TopicSpec = topics
             .lookup_by_key(&topic)
             .await?
             .ok_or_else(|| FluvioError::TopicNotFound(topic.to_string()))?
             .spec;
         let partition_count = topic_spec.partitions();
 
-        let compression =
-            match topic_spec.get_compression_type() {
-                CompressionAlgorithm::Any => config.compression.unwrap_or_default(),
-                CompressionAlgorithm::Gzip => match config.compression {
-                    Some(Compression::Gzip) | None => Compression::Gzip,
-                    Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
-                        format!("Compression in the producer ({compression_config}) does not match with topic level compression (gzip)" ),
-                    )).into()),
-                },
-                CompressionAlgorithm::Snappy => match config.compression {
-                    Some(Compression::Snappy) | None => Compression::Snappy,
-                    Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
-                        format!("Compression in the producer ({compression_config}) does not match with topic level compression (snappy)" ),
-                    )).into()),
-                },
-                CompressionAlgorithm::Lz4 => match config.compression {
-                    Some(Compression::Lz4) | None => Compression::Lz4,
-                    Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
-                        format!("Compression in the producer ({compression_config}) does not match with topic level compression (lz4)"),
-                    )).into()),
-                },
-                CompressionAlgorithm::Zstd => match config.compression {
-                    Some(Compression::Zstd) | None => Compression::Zstd,
-                    Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
-                        format!("Compression in the producer ({compression_config}) does not match with topic level compression (zstd)" ),
-                    )).into()),
-                },
-            CompressionAlgorithm::None => match config.compression {
-                    Some(Compression::None) | None => Compression::None,
-                    Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
-                        format!("Compression in the producer ({compression_config}) does not match with topic level compression (no compression)" )
-
-                    )).into()),
-                },
-            };
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "compress")] {
+                let compression = determine_producer_compression_algo(config.clone(), topic_spec)?;
+            } else {
+                let compression = Compression::None;
+            }
+        }
 
         let record_accumulator = RecordAccumulator::new(
             config.batch_size,
+            config.max_request_size,
             config.batch_queue_size,
             partition_count,
             compression,
         );
-        let producer_pool = ProducerPool::shared(
+        let producer_pool = ProducerPool::new(
             config.clone(),
             topic.clone(),
             spu_pool.clone(),
-            record_accumulator.batches(),
+            Arc::new(record_accumulator.batches().await),
             metrics.clone(),
         );
 
@@ -379,8 +440,9 @@ impl TopicProducer {
                 config,
                 topic,
                 spu_pool,
-                producer_pool,
-                record_accumulator,
+                producer_pool: Arc::new(RwLock::new(producer_pool)),
+                record_accumulator: Arc::new(record_accumulator),
+                metrics: metrics.clone(),
             }),
             #[cfg(feature = "smartengine")]
             sm_chain: Default::default(),
@@ -388,13 +450,21 @@ impl TopicProducer {
         })
     }
 
+    pub fn topic(&self) -> &str {
+        &self.inner.topic
+    }
+
+    pub fn config(&self) -> &TopicProducerConfig {
+        &self.inner.config
+    }
+
     /// Send all the queued records in the producer batches.
     ///
     /// # Example
     ///
     /// ```
-    /// # use fluvio::{TopicProducer, FluvioError};
-    /// # async fn example(producer: &TopicProducer) -> anyhow::Result<()> {
+    /// # use fluvio::{TopicProducerPool, FluvioError};
+    /// # async fn example(producer: &TopicProducerPool) -> anyhow::Result<()> {
     /// producer.send("Key", "Value").await?;
     /// producer.flush().await?;
     /// # Ok(())
@@ -416,8 +486,8 @@ impl TopicProducer {
     /// # Example
     ///
     /// ```
-    /// # use fluvio::{TopicProducer, FluvioError};
-    /// # async fn example(producer: &TopicProducer) -> anyhow::Result<()> {
+    /// # use fluvio::{TopicProducerPool, FluvioError};
+    /// # async fn example(producer: &TopicProducerPool) -> anyhow::Result<()> {
     /// producer.send("Key", "Value").await?;
     /// # Ok(())
     /// # }
@@ -499,14 +569,182 @@ impl TopicProducer {
     pub fn metrics(&self) -> Arc<ClientMetrics> {
         self.metrics.clone()
     }
+}
 
-    #[cfg(feature = "stats")]
-    /// Return a `ClientStatsDataFrame` to represent the current recorded client stats
-    pub fn stats(&self) -> Option<ClientStatsDataFrame> {
-        if self.inner.client_stats.stats_collect() != ClientStatsDataCollect::None {
-            Some(self.inner.client_stats.get_dataframe())
-        } else {
-            None
+#[cfg(feature = "compress")]
+fn determine_producer_compression_algo(
+    config: Arc<TopicProducerConfig>,
+    topic_spec: fluvio_sc_schema::topic::TopicSpec,
+) -> Result<Compression> {
+    let result = match topic_spec.get_compression_type() {
+        CompressionAlgorithm::Any => config.compression.unwrap_or_default(),
+        CompressionAlgorithm::Gzip => match config.compression {
+            Some(Compression::Gzip) | None => Compression::Gzip,
+            Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
+                format!("Compression in the producer ({compression_config}) does not match with topic level compression (gzip)" ),
+            )).into()),
+        },
+        CompressionAlgorithm::Snappy => match config.compression {
+            Some(Compression::Snappy) | None => Compression::Snappy,
+            Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
+                format!("Compression in the producer ({compression_config}) does not match with topic level compression (snappy)" ),
+            )).into()),
+        },
+        CompressionAlgorithm::Lz4 => match config.compression {
+            Some(Compression::Lz4) | None => Compression::Lz4,
+            Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
+                format!("Compression in the producer ({compression_config}) does not match with topic level compression (lz4)"),
+            )).into()),
+        },
+        CompressionAlgorithm::Zstd => match config.compression {
+            Some(Compression::Zstd) | None => Compression::Zstd,
+            Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
+                format!("Compression in the producer ({compression_config}) does not match with topic level compression (zstd)" ),
+            )).into()),
+        },
+    CompressionAlgorithm::None => match config.compression {
+            Some(Compression::None) | None => Compression::None,
+            Some(compression_config) => return Err(FluvioError::Producer(ProducerError::InvalidConfiguration(
+                format!("Compression in the producer ({compression_config}) does not match with topic level compression (no compression)" )
+
+            )).into()),
+        },
+    };
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use fluvio_protocol::record::RecordKey;
+    use fluvio_sc_schema::{partition::PartitionSpec, store::MetadataStoreObject, topic::TopicSpec};
+    use fluvio_socket::{ClientConfig, SocketError, StreamSocket, VersionedSerialSocket};
+    use fluvio_stream_dispatcher::metadata::local::LocalMetadataItem;
+    use fluvio_types::SpuId;
+
+    use crate::{
+        metrics::ClientMetrics,
+        spu::SpuPool,
+        sync::{MetadataStores, StoreContext},
+        FluvioError, TopicProducer, TopicProducerConfig,
+    };
+
+    struct SpuPoolMock {
+        topics: StoreContext<TopicSpec>,
+    }
+
+    #[async_trait]
+    impl SpuPool for SpuPoolMock {
+        fn start(
+            _config: Arc<ClientConfig>,
+            _metadata: MetadataStores,
+        ) -> Result<Self, SocketError> {
+            todo!()
         }
+
+        async fn connect_to_leader(&self, _leader: SpuId) -> Result<StreamSocket, FluvioError> {
+            todo!()
+        }
+
+        async fn create_serial_socket_from_leader(
+            &self,
+            _leader_id: SpuId,
+        ) -> Result<VersionedSerialSocket, FluvioError> {
+            todo!()
+        }
+
+        async fn topic_exists(&self, _topic: String) -> Result<bool, FluvioError> {
+            todo!()
+        }
+
+        fn shutdown(&mut self) {
+            todo!()
+        }
+
+        fn topics(&self) -> &StoreContext<TopicSpec> {
+            &self.topics
+        }
+
+        fn partitions(&self) -> &StoreContext<PartitionSpec> {
+            todo!()
+        }
+    }
+
+    #[fluvio_future::test]
+    async fn test_topic_producer_should_detect_new_partitions() {
+        let topic = "test".to_string();
+        let config = Arc::new(TopicProducerConfig::default());
+        let metrics = Arc::new(ClientMetrics::default());
+        let partitions_count = 2;
+
+        let topic_2_partitions = vec![
+            MetadataStoreObject::<TopicSpec, LocalMetadataItem>::with_spec(
+                "test",
+                (partitions_count, 2, false).into(), // 2 partitions, 2 replicas, not ignore rack
+            ),
+        ];
+
+        let topics = StoreContext::<TopicSpec>::new();
+        let spu_pool = Arc::new(SpuPoolMock { topics });
+        spu_pool.topics().store().sync_all(topic_2_partitions).await;
+        let producer = TopicProducer::new(topic.clone(), spu_pool.clone(), config, metrics)
+            .await
+            .expect("producer");
+
+        let _ = producer
+            .send(RecordKey::NULL, "123".to_string())
+            .await
+            .expect("send");
+        let _ = producer
+            .send(RecordKey::NULL, "456".to_string())
+            .await
+            .expect("send");
+
+        let batches = producer.inner.record_accumulator.batches().await;
+
+        assert_eq!(batches.len(), partitions_count as usize);
+
+        let producer_pool = producer.inner.producer_pool.read().await;
+        assert_eq!(producer_pool.errors.len(), partitions_count as usize);
+        assert!(producer_pool.errors.get(&0).unwrap().read().await.is_none());
+        assert!(producer_pool.errors.get(&1).unwrap().read().await.is_none());
+        assert_eq!(producer_pool.flush_events.len(), partitions_count as usize);
+        assert_eq!(producer_pool.end_events.len(), partitions_count as usize);
+        drop(producer_pool);
+
+        assert_eq!(producer.inner.topic, topic.clone());
+
+        let new_partitions_count = 3;
+
+        let topic_3_partitions = vec![
+            MetadataStoreObject::<TopicSpec, LocalMetadataItem>::with_spec(
+                "test",
+                (new_partitions_count, 2, false).into(), // 3 partitions, 2 replicas, not ignore rack
+            ),
+        ];
+
+        spu_pool.topics.store().sync_all(topic_3_partitions).await;
+
+        let _ = producer
+            .send(RecordKey::NULL, "789".to_string())
+            .await
+            .expect("send");
+
+        let producer_pool = producer.inner.producer_pool.read().await;
+        assert_eq!(producer_pool.errors.len(), new_partitions_count as usize);
+        assert!(producer_pool.errors.get(&0).unwrap().read().await.is_none());
+        assert!(producer_pool.errors.get(&1).unwrap().read().await.is_none());
+        assert_eq!(
+            producer_pool.flush_events.len(),
+            new_partitions_count as usize
+        );
+        assert_eq!(
+            producer_pool.end_events.len(),
+            new_partitions_count as usize
+        );
+        drop(producer_pool);
     }
 }

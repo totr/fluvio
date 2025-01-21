@@ -23,11 +23,8 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust Cargo files
         uses: Swatinem/rust-cache@v2
@@ -36,7 +33,7 @@ jobs:
           key: benches-${{ runner.os }}-unit_fluvio_protocol-rust
 
       - name: Cache Benchmark data
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         if: github.ref == 'refs/heads/master'
         with:
           path: ./benches_cache
@@ -69,11 +66,8 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust Cargo files
         uses: Swatinem/rust-cache@v2
@@ -82,7 +76,7 @@ jobs:
           key: benches-${{ runner.os }}-unit_fluvio_smartmodule-rust
 
       - name: Cache Benchmark data
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         if: github.ref == 'refs/heads/master'
         with:
           path: ./benches_cache

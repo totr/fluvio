@@ -87,8 +87,6 @@ impl OffsetPosition for Entry {
 ///
 /// For active segment, index can grow
 /// For non active, it is fixed
-
-// implement index file
 pub struct LogIndex {
     #[allow(dead_code)]
     mmap: MemoryMappedFile,
@@ -119,7 +117,7 @@ impl LogIndex {
 
         debug!(len, "memory mapped len");
 
-        if len > std::u32::MAX as u64 {
+        if len > u32::MAX as u64 {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
                 "index file should not exceed u32",

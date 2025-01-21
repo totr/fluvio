@@ -4,6 +4,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use anyhow::Result;
 use fluvio::config::TlsPolicy;
 use fluvio_command::CommandExt;
 use tracing::info;
@@ -17,6 +18,8 @@ pub struct ScProcess {
     pub tls_policy: TlsPolicy,
     pub rust_log: String,
     pub mode: ScMode,
+    pub public_address: String,
+    pub private_address: Option<String>,
 }
 
 #[derive(Debug)]
@@ -29,7 +32,7 @@ pub enum ScMode {
 impl FluvioLocalProcess for ScProcess {}
 
 impl ScProcess {
-    pub fn start(&self) -> Result<(), LocalRuntimeError> {
+    pub fn start(&self) -> Result<()> {
         let outputs = File::create(format!("{}/flv_sc.log", self.log_dir.display()))?;
         let errors = outputs.try_clone()?;
 
@@ -52,6 +55,12 @@ impl ScProcess {
                 binary.arg("--k8");
             }
         };
+
+        binary.arg("--bind-public").arg(&self.public_address);
+
+        if let Some(address) = &self.private_address {
+            binary.arg("--bind-private").arg(address);
+        }
 
         if let TlsPolicy::Verified(tls) = &self.tls_policy {
             self.set_server_tls(&mut binary, tls, 9005)?;
